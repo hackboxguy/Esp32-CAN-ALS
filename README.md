@@ -90,6 +90,7 @@ sudo ip link set up can0
 
 ### ESP32 Firmware
 ```bash
+git clone https://github.com/hackboxguy/Esp32-CAN-ALS.git
 cd Esp32-CAN-ALS/
 
 # Set target (adjust for your ESP32 variant)
