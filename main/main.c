@@ -1,16 +1,15 @@
-/* main.c - ESP32-C6 CAN Lux Sensor with Calibration */
+/* main.c - ESP32-C6 CAN Lux Sensor with VEML7700 Auto-Ranging */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
 #include <esp_log.h>
 #include <driver/twai.h>
 #include <driver/i2c.h>
-#include <nvs_flash.h>
-#include <nvs.h>
 
 #define CAN_TX_GPIO_NUM         GPIO_NUM_4
 #define CAN_RX_GPIO_NUM         GPIO_NUM_5
@@ -25,9 +24,6 @@
 #define ID_MASTER_STOP_CMD      0x0A0
 #define ID_MASTER_START_CMD     0x0A1
 #define ID_MASTER_DATA          0x0A2
-#define ID_CALIBRATION_CMD      0x0A3
-#define ID_CALIBRATION_RESP     0x0A4
-#define ID_RAW_SENSOR_DATA      0x0A5
 
 // VEML7700 I2C Configuration
 #define I2C_MASTER_NUM          I2C_NUM_0
@@ -36,71 +32,174 @@
 #define VEML7700_REG_CONF       0x00
 #define VEML7700_REG_ALS        0x04
 
-    // Calibration commands
-#define CAL_CMD_ENTER           0x01
-#define CAL_CMD_SET_REFERENCE   0x02
-#define CAL_CMD_SAVE            0x03
-#define CAL_CMD_EXIT            0x04
-#define CAL_CMD_GET_OFFSET      0x05
-#define CAL_CMD_RESET           0x06
+// VEML7700 Configuration Bits (aligned with datasheet)
+#define VEML7700_GAIN_1X        (0x00 << 11)  // 0x0000
+#define VEML7700_GAIN_2X        (0x01 << 11)  // 0x0800
+#define VEML7700_GAIN_1_4X      (0x02 << 11)  // 0x1000
+#define VEML7700_GAIN_1_8X      (0x03 << 11)  // 0x1800
 
-// NVS key for calibration
-#define NVS_NAMESPACE           "lux_sensor"
-#define NVS_CALIBRATION_KEY     "cal_offset"
+#define VEML7700_IT_25MS        0x0300
+#define VEML7700_IT_50MS        0x0200
+#define VEML7700_IT_100MS       0x0000
+#define VEML7700_IT_200MS       0x0040
+#define VEML7700_IT_400MS       0x0080
+#define VEML7700_IT_800MS       0x00C0
 
-typedef enum {
-    CAL_STATE_NORMAL = 0,
-    CAL_STATE_ACTIVE = 1,
-    CAL_STATE_WAITING_REF = 2
-} calibration_state_t;
+#define VEML7700_POWER_ON       0x0000
+#define VEML7700_POWER_OFF      0x0001
+
+// Auto-ranging parameters
+#define SATURATED_HIGH          60000   // Near ADC saturation
+#define OPTIMAL_HIGH            40000   // Upper optimal range
+#define OPTIMAL_LOW             10000   // Lower optimal range
+#define TOO_LOW                 2000    // Force sensitivity increase
+
+// History tracking for stability
+#define READING_HISTORY_SIZE    5
+#define SETTLE_READINGS_REQUIRED 3
+#define CONSISTENCY_READINGS    3
+
+// Moving average filter settings
+#define MOVING_AVG_SAMPLES      8
 
 static const char *TAG = "CAN_LUX_SENSOR";
 
-static SemaphoreHandle_t ctrl_task_sem;
 static SemaphoreHandle_t done_sem;
 static SemaphoreHandle_t start_sem;
 
-// Calibration variables
-static float calibration_offset = 0.0;
-static calibration_state_t calibration_state = CAL_STATE_NORMAL;
-static float reference_lux = 0.0;
-
-/* --------------------------- NVS Functions -------------------------------- */
-
-static esp_err_t save_calibration_offset(float offset)
-{
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    err = nvs_set_blob(nvs_handle, NVS_CALIBRATION_KEY, &offset, sizeof(float));
-    if (err == ESP_OK) {
-        err = nvs_commit(nvs_handle);
-    }
-
-    nvs_close(nvs_handle);
-    return err;
+// Add this function to help debug the calibration
+static void debug_calibration(float raw_lux, float calibrated_lux, const char* range) {
+    ESP_LOGI(TAG, "Calibration debug: raw=%.1f, calibrated=%.1f, range=%s", 
+             raw_lux, calibrated_lux, range);
 }
 
-static esp_err_t load_calibration_offset(float *offset)
-{
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
-    if (err != ESP_OK) {
-        *offset = 0.0;  // Default to no offset
-        return err;
+// calibration function(old but no so precise)
+static float calibrate_lux_old(float raw_lux) {
+    // Linear calibration based on your measurements: y = 0.0004x + 1.7
+    // where x is the raw lux value and y is the calibration factor
+    float calibration_factor = 0.0004f * raw_lux + 1.7f;
+    return raw_lux * calibration_factor;
+}
+static float calibrate_lux(float raw_lux) {
+    // Revised calibration based on your measurements
+    // Uses a polynomial fit for better accuracy across the range
+    if (raw_lux < 10.0f) {
+        return raw_lux * 0.85f;  // Adjustment for very low light
+    } else if (raw_lux < 100.0f) {
+        return raw_lux * 0.92f;  // Adjustment for low light
+    } else if (raw_lux < 500.0f) {
+        return raw_lux * 1.05f;  // Adjustment for medium light
+    } else if (raw_lux < 1000.0f) {
+        return raw_lux * 1.12f;  // Adjustment for high light
+    } else {
+        return raw_lux * 1.18f;  // Adjustment for very high light
+    }
+}
+
+// VEML7700 Configuration Structure
+typedef struct {
+    uint16_t gain_bits;
+    uint16_t it_bits;
+    float gain_value;
+    float it_ms;
+    float resolution;  // counts per lux (approximate)
+} SensorConfig;
+
+// Helper functions for SensorConfig
+static uint16_t sensor_config_get_config_word(const SensorConfig* config) {
+    return config->gain_bits | config->it_bits | VEML7700_POWER_ON;
+}
+
+static const char* sensor_config_gain_str(const SensorConfig* config) {
+    if (config->gain_bits == VEML7700_GAIN_1X) return "1x";
+    if (config->gain_bits == VEML7700_GAIN_2X) return "2x";
+    if (config->gain_bits == VEML7700_GAIN_1_4X) return "1/4x";
+    if (config->gain_bits == VEML7700_GAIN_1_8X) return "1/8x";
+    return "?";
+}
+
+static const char* sensor_config_it_str(const SensorConfig* config) {
+    if (config->it_bits == VEML7700_IT_25MS) return "25ms";
+    if (config->it_bits == VEML7700_IT_50MS) return "50ms";
+    if (config->it_bits == VEML7700_IT_100MS) return "100ms";
+    if (config->it_bits == VEML7700_IT_200MS) return "200ms";
+    if (config->it_bits == VEML7700_IT_400MS) return "400ms";
+    if (config->it_bits == VEML7700_IT_800MS) return "800ms";
+    return "?";
+}
+
+// Configuration table based on C++ code (11 configurations)
+static const SensorConfig g_configs[] = {
+    // 2x gain configurations
+    {VEML7700_GAIN_2X, VEML7700_IT_800MS, 2.0f, 800.0f, 0.0036f},
+    {VEML7700_GAIN_2X, VEML7700_IT_400MS, 2.0f, 400.0f, 0.0072f},
+    {VEML7700_GAIN_2X, VEML7700_IT_200MS, 2.0f, 200.0f, 0.0144f},
+    {VEML7700_GAIN_2X, VEML7700_IT_100MS, 2.0f, 100.0f, 0.0288f},
+    {VEML7700_GAIN_2X, VEML7700_IT_50MS, 2.0f, 50.0f, 0.0576f},
+
+    // 1x gain configurations
+    {VEML7700_GAIN_1X, VEML7700_IT_800MS, 1.0f, 800.0f, 0.0072f},
+    {VEML7700_GAIN_1X, VEML7700_IT_400MS, 1.0f, 400.0f, 0.0144f},
+    {VEML7700_GAIN_1X, VEML7700_IT_200MS, 1.0f, 200.0f, 0.0288f},
+    {VEML7700_GAIN_1X, VEML7700_IT_100MS, 1.0f, 100.0f, 0.0576f},
+    {VEML7700_GAIN_1X, VEML7700_IT_50MS, 1.0f, 50.0f, 0.1152f},
+    {VEML7700_GAIN_1X, VEML7700_IT_25MS, 1.0f, 25.0f, 0.2304f},
+
+    // 1/4x gain configurations
+    {VEML7700_GAIN_1_4X, VEML7700_IT_800MS, 0.25f, 800.0f, 0.0288f},
+    {VEML7700_GAIN_1_4X, VEML7700_IT_400MS, 0.25f, 400.0f, 0.0576f},
+    {VEML7700_GAIN_1_4X, VEML7700_IT_200MS, 0.25f, 200.0f, 0.1152f},
+    {VEML7700_GAIN_1_4X, VEML7700_IT_100MS, 0.25f, 100.0f, 0.2304f},
+
+    // 1/8x gain configurations
+    {VEML7700_GAIN_1_8X, VEML7700_IT_800MS, 0.125f, 800.0f, 0.0576f},
+    {VEML7700_GAIN_1_8X, VEML7700_IT_400MS, 0.125f, 400.0f, 0.1152f},
+    {VEML7700_GAIN_1_8X, VEML7700_IT_200MS, 0.125f, 200.0f, 0.2304f},
+};
+
+#define NUM_CONFIGS (sizeof(g_configs) / sizeof(g_configs[0]))
+
+// Moving average filter structure
+typedef struct {
+    float samples[MOVING_AVG_SAMPLES];
+    int index;
+    int count;
+    float sum;
+} moving_avg_filter_t;
+
+// Intelligent range switching state
+typedef struct {
+    uint16_t raw_counts_history[READING_HISTORY_SIZE];
+    int history_index;
+    int history_count;
+    int readings_since_change;
+    bool range_change_pending;
+} range_switch_state_t;
+
+// State tracking
+static moving_avg_filter_t lux_filter = {0};
+static range_switch_state_t range_state = {0};
+static int current_config_idx = 7;  // Start with 1x gain, 100ms integration
+static TickType_t last_range_switch_time = 0;
+
+/* --------------------------- Moving Average Filter ------------------------ */
+
+static void moving_avg_init(moving_avg_filter_t *filter) {
+    memset(filter, 0, sizeof(moving_avg_filter_t));
+}
+
+static float moving_avg_update(moving_avg_filter_t *filter, float new_value) {
+    if (filter->count == MOVING_AVG_SAMPLES) {
+        filter->sum -= filter->samples[filter->index];
+    } else {
+        filter->count++;
     }
 
-    size_t required_size = sizeof(float);
-    err = nvs_get_blob(nvs_handle, NVS_CALIBRATION_KEY, offset, &required_size);
-    if (err != ESP_OK) {
-        *offset = 0.0;  // Default to no offset
-    }
+    filter->samples[filter->index] = new_value;
+    filter->sum += new_value;
+    filter->index = (filter->index + 1) % MOVING_AVG_SAMPLES;
 
-    nvs_close(nvs_handle);
-    return err;
+    return filter->sum / filter->count;
 }
 
 /* --------------------------- VEML7700 Functions --------------------------- */
@@ -130,12 +229,17 @@ static esp_err_t veml7700_write_reg(uint8_t reg, uint16_t data)
     i2c_master_start(cmd);
     i2c_master_write_byte(cmd, (VEML7700_I2C_ADDR << 1) | I2C_MASTER_WRITE, true);
     i2c_master_write_byte(cmd, reg, true);
-    i2c_master_write_byte(cmd, data & 0xFF, true);        // Low byte
-    i2c_master_write_byte(cmd, (data >> 8) & 0xFF, true); // High byte
+    i2c_master_write_byte(cmd, data & 0xFF, true);
+    i2c_master_write_byte(cmd, (data >> 8) & 0xFF, true);
     i2c_master_stop(cmd);
 
     esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(100));
     i2c_cmd_link_delete(cmd);
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "I2C write error: %s", esp_err_to_name(ret));
+    }
+
     return ret;
 }
 
@@ -158,179 +262,231 @@ static esp_err_t veml7700_read_reg(uint8_t reg, uint16_t *data)
 
     if (ret == ESP_OK) {
         *data = (data_rd[1] << 8) | data_rd[0];
+    } else {
+        ESP_LOGE(TAG, "I2C read error: %s", esp_err_to_name(ret));
     }
 
+    return ret;
+}
+
+static esp_err_t veml7700_read_raw_counts(uint16_t *counts)
+{
+    return veml7700_read_reg(VEML7700_REG_ALS, counts);
+}
+
+static esp_err_t veml7700_set_config(int config_idx)
+{
+    if (config_idx < 0 || config_idx >= NUM_CONFIGS) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t ret = veml7700_write_reg(VEML7700_REG_CONF, sensor_config_get_config_word(&g_configs[config_idx]));
+    if (ret == ESP_OK) {
+        current_config_idx = config_idx;
+        last_range_switch_time = xTaskGetTickCount();
+
+        // Reset moving average filter and range state after config change
+        moving_avg_init(&lux_filter);
+        range_state.readings_since_change = 0;
+        range_state.history_count = 0;
+        range_state.history_index = 0;
+
+        // Verify configuration was written correctly
+        uint16_t readback_config;
+        if (veml7700_read_reg(VEML7700_REG_CONF, &readback_config) == ESP_OK) {
+            ESP_LOGI(TAG, "Config %d: %s gain, %s integration, config=0x%04X, readback=0x%04X",
+                     config_idx,
+                     sensor_config_gain_str(&g_configs[config_idx]),
+                     sensor_config_it_str(&g_configs[config_idx]),
+                     sensor_config_get_config_word(&g_configs[config_idx]),
+                     readback_config);
+        }
+    }
     return ret;
 }
 
 static esp_err_t veml7700_init(void)
 {
-    // Configure VEML7700: ALS integration time 100ms, gain 1, enable ALS
-    uint16_t config = 0x0000;  // Default configuration
-    return veml7700_write_reg(VEML7700_REG_CONF, config);
+    moving_avg_init(&lux_filter);
+    memset(&range_state, 0, sizeof(range_state));
+    return veml7700_set_config(current_config_idx);
 }
 
-static esp_err_t veml7700_read_lux(float *lux)
-{
-    uint16_t als_data;
-    esp_err_t ret = veml7700_read_reg(VEML7700_REG_ALS, &als_data);
+/* --------------------------- Intelligent Auto-Ranging -------------------- */
 
-    if (ret == ESP_OK) {
-        // Convert raw ALS data to lux and apply calibration offset
-        float raw_lux = als_data * 0.0036;
-        *lux = raw_lux + calibration_offset;
+static void update_reading_history(uint16_t raw_counts) {
+    range_state.raw_counts_history[range_state.history_index] = raw_counts;
+    range_state.history_index = (range_state.history_index + 1) % READING_HISTORY_SIZE;
 
-        // Ensure lux value is not negative
-        if (*lux < 0.0) {
-            *lux = 0.0;
+    if (range_state.history_count < READING_HISTORY_SIZE) {
+        range_state.history_count++;
+    }
+
+    range_state.readings_since_change++;
+}
+
+static bool readings_consistently_high(void) {
+    if (range_state.history_count < CONSISTENCY_READINGS) return false;
+
+    int check_count = (range_state.history_count < CONSISTENCY_READINGS) ?
+                      range_state.history_count : CONSISTENCY_READINGS;
+
+    for (int i = 0; i < check_count; i++) {
+        int idx = (range_state.history_index - 1 - i + READING_HISTORY_SIZE) % READING_HISTORY_SIZE;
+        if (range_state.raw_counts_history[idx] <= OPTIMAL_HIGH) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool readings_consistently_low(void) {
+    if (range_state.history_count < CONSISTENCY_READINGS) return false;
+
+    int check_count = (range_state.history_count < CONSISTENCY_READINGS) ?
+                      range_state.history_count : CONSISTENCY_READINGS;
+
+    for (int i = 0; i < check_count; i++) {
+        int idx = (range_state.history_index - 1 - i + READING_HISTORY_SIZE) % READING_HISTORY_SIZE;
+        if (range_state.raw_counts_history[idx] >= OPTIMAL_LOW) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int determine_optimal_config(uint16_t raw_counts) {
+    // Update history
+    update_reading_history(raw_counts);
+
+    // Don't adjust immediately after a configuration change
+    if (range_state.readings_since_change < SETTLE_READINGS_REQUIRED) {
+        ESP_LOGD(TAG, "Settling after config change (%d/%d readings)",
+                 range_state.readings_since_change, SETTLE_READINGS_REQUIRED);
+        return current_config_idx;
+    }
+
+    // Determine if config adjustment is needed - SINGLE STEP ONLY
+    int adjustment = 0;
+    const char* reason = "";
+
+    // Critical thresholds - immediate action required
+    if (raw_counts >= SATURATED_HIGH || raw_counts >= 65000) {
+        // Near saturation - decrease sensitivity immediately
+        adjustment = 1;  // Move to less sensitive config
+        reason = raw_counts >= 64000 ? "SATURATED" : "TOO_HIGH";
+
+    } else if (raw_counts < TOO_LOW && raw_counts > 0) {
+        // Too low - increase sensitivity immediately
+        adjustment = -1;  // Move to more sensitive config
+        reason = raw_counts < 500 ? "VERY_LOW" : "TOO_LOW";
+
+    } else if (raw_counts >= OPTIMAL_LOW && raw_counts <= OPTIMAL_HIGH) {
+        // In optimal range - no change needed
+        ESP_LOGV(TAG, "Raw counts %d in optimal range (%d-%d)",
+                 raw_counts, OPTIMAL_LOW, OPTIMAL_HIGH);
+        return current_config_idx;
+
+    } else {
+        // In acceptable but not optimal range - use consistency check
+        if (raw_counts > OPTIMAL_HIGH && raw_counts < SATURATED_HIGH) {
+            // Check if consistently high
+            if (readings_consistently_high()) {
+                adjustment = 1;  // Less sensitive
+                reason = "CONSISTENTLY_HIGH";
+            }
+        } else if (raw_counts < OPTIMAL_LOW && raw_counts >= TOO_LOW) {
+            // Check if consistently low
+            if (readings_consistently_low()) {
+                adjustment = -1;  // More sensitive
+                reason = "CONSISTENTLY_LOW";
+            }
         }
     }
 
-    return ret;
-}
+    // Apply single-step adjustment
+    if (adjustment != 0) {
+        int new_config_idx = current_config_idx + adjustment;
 
-static esp_err_t veml7700_read_raw_lux(float *raw_lux)
-{
-    uint16_t als_data;
-    esp_err_t ret = veml7700_read_reg(VEML7700_REG_ALS, &als_data);
+        // Clamp to valid range
+        if (new_config_idx < 0) new_config_idx = 0;
+        if (new_config_idx >= NUM_CONFIGS) new_config_idx = NUM_CONFIGS - 1;
 
-    if (ret == ESP_OK) {
-        // Return raw lux without calibration offset
-        *raw_lux = als_data * 0.0036;
+        if (new_config_idx != current_config_idx) {
+            ESP_LOGI(TAG, "Config switch: %d->%d, reason=%s (raw_counts=%d)",
+                     current_config_idx, new_config_idx, reason, raw_counts);
+
+            return new_config_idx;
+        }
     }
 
-    return ret;
+    return current_config_idx;
 }
 
-/* --------------------------- Calibration Functions ----------------------- */
+static esp_err_t veml7700_read_lux_with_auto_ranging(float *stable_lux) {
+    uint16_t raw_counts;
+    esp_err_t ret = veml7700_read_raw_counts(&raw_counts);
 
-static void send_calibration_response(uint8_t command, uint8_t status, const uint8_t *data, size_t data_len)
-{
-    twai_message_t response_msg;
-    response_msg.identifier = ID_CALIBRATION_RESP;
-    response_msg.flags = TWAI_MSG_FLAG_NONE;
-    response_msg.data_length_code = 8;
-
-    memset(response_msg.data, 0, 8);
-    response_msg.data[0] = command;  // Echo command
-    response_msg.data[1] = status;   // 0x00=OK, 0x01=Error
-
-    // Copy data if provided
-    if (data && data_len > 0) {
-        size_t copy_len = (data_len > 6) ? 6 : data_len;
-        memcpy(&response_msg.data[2], data, copy_len);
+    if (ret != ESP_OK) {
+        return ret;
     }
 
-    twai_transmit(&response_msg, pdMS_TO_TICKS(1000));
-}
+    // Apply intelligent auto-ranging
+    int optimal_config = determine_optimal_config(raw_counts);
 
-static void send_raw_sensor_data(float raw_lux)
-{
-    twai_message_t raw_msg;
-    raw_msg.identifier = ID_RAW_SENSOR_DATA;
-    raw_msg.flags = TWAI_MSG_FLAG_NONE;
-    raw_msg.data_length_code = 8;
+    // Switch config if needed
+    if (optimal_config != current_config_idx) {
+        ret = veml7700_set_config(optimal_config);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Config switch failed, continuing with current config");
+        } else {
+            // Wait for sensor to settle after config change
+            // Integration time * 3 + settling time, based on Linux implementation
+            float settle_time = g_configs[optimal_config].it_ms * 3.0f + 200;
+            vTaskDelay(pdMS_TO_TICKS((int)settle_time));
 
-    uint16_t raw_lux_int = (uint16_t)(raw_lux > 65535.0 ? 65535 : raw_lux);
-
-    memset(raw_msg.data, 0, 8);
-    raw_msg.data[0] = raw_lux_int & 0xFF;
-    raw_msg.data[1] = (raw_lux_int >> 8) & 0xFF;
-    raw_msg.data[2] = 0xAA;  // Raw data marker
-    raw_msg.data[3] = 0x55;  // Raw data marker
-
-    twai_transmit(&raw_msg, pdMS_TO_TICKS(1000));
-}
-
-static void handle_calibration_command(uint8_t command, const uint8_t *data)
-{
-    switch (command) {
-        case CAL_CMD_ENTER:
-            calibration_state = CAL_STATE_ACTIVE;
-            send_calibration_response(command, 0x00, NULL, 0);  // OK
-            break;
-
-        case CAL_CMD_SET_REFERENCE:
-            if (calibration_state == CAL_STATE_ACTIVE) {
-                // Extract reference lux value (16-bit)
-                reference_lux = (float)(data[0] | (data[1] << 8));
-
-                // Read current raw sensor value
-                float current_raw_lux;
-                if (veml7700_read_raw_lux(&current_raw_lux) == ESP_OK) {
-                    // Calculate offset: reference - current_raw
-                    calibration_offset = reference_lux - current_raw_lux;
-                    calibration_state = CAL_STATE_WAITING_REF;
-                    send_calibration_response(command, 0x00, NULL, 0);  // OK
-                } else {
-                    send_calibration_response(command, 0x01, NULL, 0);  // Error
+            // Read fresh counts with new config and discard stale readings
+            for (int i = 0; i < 3; i++) {
+                ret = veml7700_read_raw_counts(&raw_counts);
+                if (ret != ESP_OK) {
+                    return ret;
                 }
-            } else {
-                send_calibration_response(command, 0x01, NULL, 0);  // Error - not in calibration mode
+                vTaskDelay(pdMS_TO_TICKS(50));
             }
-            break;
 
-        case CAL_CMD_SAVE:
-            if (calibration_state == CAL_STATE_WAITING_REF) {
-                if (save_calibration_offset(calibration_offset) == ESP_OK) {
-                    send_calibration_response(command, 0x00, NULL, 0);  // OK
-                } else {
-                    send_calibration_response(command, 0x01, NULL, 0);  // Error saving
-                }
-            } else {
-                send_calibration_response(command, 0x01, NULL, 0);  // Error - no calibration calculated
-            }
-            break;
-
-        case CAL_CMD_EXIT:
-            calibration_state = CAL_STATE_NORMAL;
-            send_calibration_response(command, 0x00, NULL, 0);  // OK
-            break;
-
-        case CAL_CMD_GET_OFFSET:
-            {
-                uint8_t offset_data[4];
-                memcpy(offset_data, &calibration_offset, sizeof(float));
-                send_calibration_response(command, 0x00, offset_data, 4);
-            }
-            break;
-
-        case CAL_CMD_RESET:
-            // Reset calibration offset to zero
-            calibration_offset = 0.0;
-
-            // Save the reset offset to NVS
-            if (save_calibration_offset(calibration_offset) == ESP_OK) {
-                send_calibration_response(command, 0x00, NULL, 0);  // OK
-            } else {
-                send_calibration_response(command, 0x01, NULL, 0);  // Error saving
-            }
-            break;
-
-        default:
-            send_calibration_response(command, 0x01, NULL, 0);  // Unknown command
-            break;
-    }
-}
-
-/* --------------------------- Message Functions ---------------------------- */
-
-static bool validate_lux_message(const twai_message_t *msg)
-{
-    if (msg->data_length_code != 8) {
-        return false;
+            // Update history with fresh reading
+            update_reading_history(raw_counts);
+        }
     }
 
-    // Calculate expected checksum
-    uint16_t expected_checksum = 0;
-    for (int i = 0; i < 6; i++) {
-        expected_checksum += msg->data[i];
-    }
+    // Convert raw counts to lux
+    float raw_lux = raw_counts * g_configs[current_config_idx].resolution;
 
-    // Extract received checksum
-    uint16_t received_checksum = msg->data[6] | (msg->data[7] << 8);
+    // Apply moving average filter for additional stability
+    float filtered_lux = moving_avg_update(&lux_filter, raw_lux);
 
-    return (expected_checksum == received_checksum);
+    // Apply calibration factor for Adafruit board with diffuser dome
+    const float DIFFUSER_CALIBRATION = 1.96f;//1.13f;
+    float calibrated_lux = filtered_lux * DIFFUSER_CALIBRATION;
+    //*stable_lux = filtered_lux * DIFFUSER_CALIBRATION;
+    *stable_lux = calibrate_lux(calibrated_lux);//extra calibration
+    if (*stable_lux < 0.0) *stable_lux = 0.0;
+
+    // Debug logging
+    const char* range = "unknown";
+    if (calibrated_lux < 50.0f) range = "low";
+    else if (calibrated_lux < 500.0f) range = "low-medium";
+    else if (calibrated_lux < 1000.0f) range = "medium-high";
+    else range = "high";
+    debug_calibration(calibrated_lux, *stable_lux, range);
+
+
+    //ESP_LOGV(TAG, "Sensor: raw_counts=%d, raw_lux=%.1f, filtered_lux=%.1f, final_lux=%.1f",
+    //         raw_counts, raw_lux, filtered_lux, *stable_lux);
+    //ESP_LOGV(TAG, "Sensor: raw_counts=%d, raw_lux=%.1f, filtered_lux=%.1f, calibrated_lux=%.1f, final_lux=%.1f",
+    //     raw_counts, raw_lux, filtered_lux, calibrated_lux, *stable_lux);
+
+    return ESP_OK;
 }
 
 /* --------------------------- Tasks and Functions -------------------------- */
@@ -342,17 +498,10 @@ static void twai_receive_task(void *arg)
     while (1) {
         if (twai_receive(&rx_msg, CAN_WAIT_FOREVER) == ESP_OK) {
             if (!(rx_msg.flags & TWAI_MSG_FLAG_RTR)) {
-                // Handle received commands
                 if (rx_msg.identifier == ID_MASTER_STOP_CMD) {
                     xSemaphoreGive(done_sem);
                 } else if (rx_msg.identifier == ID_MASTER_START_CMD) {
                     xSemaphoreGive(start_sem);
-                } else if (rx_msg.identifier == ID_CALIBRATION_CMD) {
-                    // Handle calibration commands
-                    if (rx_msg.data_length_code >= 1) {
-                        uint8_t command = rx_msg.data[0];
-                        handle_calibration_command(command, &rx_msg.data[1]);
-                    }
                 }
             }
         }
@@ -365,85 +514,56 @@ static void twai_transmit_task(void *arg)
     float lux_value = 0.0;
     uint16_t lux_int = 0;
     uint8_t sequence_counter = 0;
-    uint8_t sensor_status = 0x00;  // 0x00=OK, 0x01=Error, 0x02=Calibrating
+    uint8_t sensor_status = 0x00;
     TickType_t xLastWakeTime = xTaskGetTickCount();
 
-    // Configure TX message
     tx_msg.identifier = ID_MASTER_DATA;
     tx_msg.flags = TWAI_MSG_FLAG_NONE;
     tx_msg.data_length_code = 8;
 
     while (1) {
-        // Wait for start command (initially or after stop)
         if (xSemaphoreTake(start_sem, portMAX_DELAY) != pdTRUE) {
             continue;
         }
 
-        // Reset sequence counter on start
         sequence_counter = 0;
         xLastWakeTime = xTaskGetTickCount();
 
-        // Transmission loop
         while (1) {
-            // Check for stop command
             if (xSemaphoreTake(done_sem, 0) == pdTRUE) {
                 break;
             }
 
-            // Read lux value from VEML7700
-            esp_err_t lux_result;
-
-            if (calibration_state == CAL_STATE_ACTIVE) {
-                // During calibration, send raw sensor data instead of normal lux messages
-                float raw_lux;
-                if (veml7700_read_raw_lux(&raw_lux) == ESP_OK) {
-                    send_raw_sensor_data(raw_lux);
-                }
-
-                // Wait for next transmission
-                vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(CAN_DATA_PERIOD_MS));
-                continue;
-            }
-
-            // Normal operation - read calibrated lux value
-            lux_result = veml7700_read_lux(&lux_value);
+            // Read lux with auto-ranging
+            esp_err_t lux_result = veml7700_read_lux_with_auto_ranging(&lux_value);
             if (lux_result == ESP_OK) {
                 lux_int = (uint16_t)(lux_value > 65535.0 ? 65535 : lux_value);
-                sensor_status = 0x00;  // OK
+                sensor_status = 0x00;
             } else {
-                lux_int = 0xFFFF;      // Error value
-                sensor_status = 0x01;  // Error
+                lux_int = 0xFFFF;
+                sensor_status = 0x01;
             }
 
-            // Set sensor status based on calibration state
-            if (calibration_state != CAL_STATE_NORMAL) {
-                sensor_status = 0x02;  // Calibrating
-            }
-
-            // Build structured message
+            // Build message
             memset(tx_msg.data, 0, 8);
-            tx_msg.data[0] = lux_int & 0xFF;        // Lux low byte
-            tx_msg.data[1] = (lux_int >> 8) & 0xFF; // Lux high byte
-            tx_msg.data[2] = sensor_status;         // Status byte
-            tx_msg.data[3] = sequence_counter;      // Sequence counter
-            tx_msg.data[4] = 0x00;                  // Reserved
-            tx_msg.data[5] = 0x00;                  // Reserved
+            tx_msg.data[0] = lux_int & 0xFF;
+            tx_msg.data[1] = (lux_int >> 8) & 0xFF;
+            tx_msg.data[2] = sensor_status;
+            tx_msg.data[3] = sequence_counter;
+            tx_msg.data[4] = current_config_idx;
+            tx_msg.data[5] = 0x00;
 
-            // Calculate simple 16-bit checksum (sum of first 6 bytes)
+            // Checksum
             uint16_t checksum = 0;
             for (int i = 0; i < 6; i++) {
                 checksum += tx_msg.data[i];
             }
-            tx_msg.data[6] = checksum & 0xFF;       // Checksum low byte
-            tx_msg.data[7] = (checksum >> 8) & 0xFF; // Checksum high byte
+            tx_msg.data[6] = checksum & 0xFF;
+            tx_msg.data[7] = (checksum >> 8) & 0xFF;
 
-            // Transmit message
             twai_transmit(&tx_msg, pdMS_TO_TICKS(1000));
-
-            // Increment sequence counter (0-255, then wrap)
             sequence_counter++;
 
-            // Wait for next transmission
             vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(CAN_DATA_PERIOD_MS));
         }
     }
@@ -455,13 +575,11 @@ static void twai_control_task(void *arg)
 {
     twai_message_t tx_msg;
 
-    // Send start command
     tx_msg.identifier = ID_MASTER_START_CMD;
     tx_msg.flags = TWAI_MSG_FLAG_NONE;
     tx_msg.data_length_code = 0;
 
     if (twai_transmit(&tx_msg, CAN_WAIT_FOREVER) == ESP_OK) {
-        // Signal transmit task to start
         xSemaphoreGive(start_sem);
     }
 
@@ -471,32 +589,22 @@ static void twai_control_task(void *arg)
 void app_main(void)
 {
     // Create semaphores
-    ctrl_task_sem = xSemaphoreCreateBinary();
     done_sem = xSemaphoreCreateBinary();
     start_sem = xSemaphoreCreateBinary();
 
-    if (ctrl_task_sem == NULL || done_sem == NULL || start_sem == NULL) {
+    if (done_sem == NULL || start_sem == NULL) {
+        ESP_LOGE(TAG, "Failed to create semaphores");
         return;
     }
-
-    // Initialize NVS
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        nvs_flash_erase();
-        ret = nvs_flash_init();
-    }
-
-    // Load calibration offset from NVS
-    load_calibration_offset(&calibration_offset);
 
     // Initialize I2C and VEML7700
-    if (i2c_master_init() != ESP_OK) {
-        return;
-    }
+    ESP_ERROR_CHECK(i2c_master_init());
+    ESP_LOGI(TAG, "I2C initialized");
 
-    if (veml7700_init() != ESP_OK) {
-        return;
-    }
+    ESP_ERROR_CHECK(veml7700_init());
+    ESP_LOGI(TAG, "VEML7700 initialized with %s gain, %s integration",
+             sensor_config_gain_str(&g_configs[current_config_idx]),
+             sensor_config_it_str(&g_configs[current_config_idx]));
 
     // Configure TWAI
     twai_general_config_t g_config = {
@@ -515,21 +623,30 @@ void app_main(void)
     twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
     // Install and start TWAI driver
-    if (twai_driver_install(&g_config, &t_config, &f_config) != ESP_OK) {
-        return;
-    }
-
-    if (twai_start() != ESP_OK) {
-        return;
-    }
+    ESP_ERROR_CHECK(twai_driver_install(&g_config, &t_config, &f_config));
+    ESP_ERROR_CHECK(twai_start());
+    ESP_LOGI(TAG, "TWAI initialized at 500kbps");
 
     // Create tasks
     xTaskCreate(twai_receive_task, "TWAI_RX", 3072, NULL, CAN_RX_TASK_PRIO, NULL);
-    xTaskCreate(twai_transmit_task, "TWAI_TX", 3072, NULL, CAN_TX_TASK_PRIO, NULL);
+    xTaskCreate(twai_transmit_task, "TWAI_TX", 4096, NULL, CAN_TX_TASK_PRIO, NULL);
     xTaskCreate(twai_control_task, "TWAI_CTRL", 2048, NULL, CAN_CTRL_TSK_PRIO, NULL);
 
-    // Keep main task alive
+    ESP_LOGI(TAG, "ESP32-C6 CAN Lux Sensor with VEML7700 Auto-Ranging started");
+    ESP_LOGI(TAG, "Auto-ranging thresholds: OPTIMAL(%d-%d counts), TOO_LOW(%d), SATURATED(%d+)",
+             OPTIMAL_LOW, OPTIMAL_HIGH, TOO_LOW, SATURATED_HIGH);
+
+    // Keep main task alive with periodic status
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(10000)); // Log status every 10 seconds
+
+        float current_lux;
+        if (veml7700_read_lux_with_auto_ranging(&current_lux) == ESP_OK) {
+            ESP_LOGI(TAG, "Status: %.1f lux, Config: %d (%s gain, %s integration), Filter samples: %d, Config readings: %d",
+                     current_lux, current_config_idx,
+                     sensor_config_gain_str(&g_configs[current_config_idx]),
+                     sensor_config_it_str(&g_configs[current_config_idx]),
+                     lux_filter.count, range_state.readings_since_change);
+        }
     }
 }

@@ -11,7 +11,6 @@
 #include <sys/ioctl.h>
 #include <signal.h>
 
-// Global pointer for signal handler
 class CANCalibrator;
 static CANCalibrator* g_calibrator = nullptr;
 
@@ -37,7 +36,35 @@ private:
     static constexpr uint8_t CAL_CMD_EXIT = 0x04;
     static constexpr uint8_t CAL_CMD_GET_OFFSET = 0x05;
     static constexpr uint8_t CAL_CMD_RESET = 0x06;
+    static constexpr uint8_t CAL_CMD_SET_REF_LOW = 0x07;
+    static constexpr uint8_t CAL_CMD_SET_REF_MED = 0x08;
+    static constexpr uint8_t CAL_CMD_SET_REF_HIGH = 0x09;
+    static constexpr uint8_t CAL_CMD_SET_REF_VERYHIGH = 0x0A;
+    static constexpr uint8_t CAL_CMD_GET_ALL_OFFSETS = 0x0B;
 
+    const char* range_names[4] = {"LOW", "MED", "HIGH", "V_HIGH"};
+
+    struct RangeInfo {
+        uint16_t min_lux;
+        uint16_t max_lux;
+        uint16_t optimal_min;
+        uint16_t optimal_max;
+        const char* description;
+    };
+
+    /*const RangeInfo range_info[4] = {
+        {1,   50,   5,   35,  "Very dim (night, parking lights)"},
+        {10,  350,  20,  250, "Normal indoor lighting"},
+        {100, 1200, 200, 800, "Bright indoor to daylight"},
+        {500, 5000, 800, 2000, "Direct sunlight, very bright conditions"}
+    };*/
+
+const RangeInfo range_info[4] = {
+    {1,   50,   5,   35,  "Very dim (night, parking lights)"},        // LOW: matches firmware (0-35)
+    {10,  1200, 20,  250, "Normal indoor lighting"},                   // MEDIUM: increased max from 900 to 1200
+    {200, 1350, 400, 800, "Bright indoor to daylight"},               // HIGH: adjusted min from 100 to 200
+    {600, 5000, 800, 2000, "Direct sunlight, very bright conditions"} // V_HIGH: matches firmware (600+)
+};
 public:
     std::atomic<bool> running{true};
     std::atomic<bool> interrupt_requested{false};
@@ -51,11 +78,10 @@ public:
     }
 
     void cleanup() {
-        // If we're in calibration mode, try to exit cleanly
         if (in_calibration_mode && can_socket >= 0) {
             std::cout << "\n[INFO] Exiting calibration mode..." << std::endl;
             send_command_simple(CAL_CMD_EXIT);
-            std::this_thread::sleep_for(std::chrono::milliseconds(500)); // Wait for response
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
 
         running = false;
@@ -129,7 +155,6 @@ public:
         return (nbytes == sizeof(struct can_frame));
     }
 
-    // Simple command sender without waiting for response (for cleanup)
     bool send_command_simple(uint8_t command) {
         if (can_socket < 0) return false;
 
@@ -167,13 +192,23 @@ public:
         uint8_t status = last_response.data[1];
 
         std::cout << "[INFO] Response: Command=0x" << std::hex << (int)echo_cmd
-                  << " Status=0x" << (int)status << std::dec << std::endl;
+                  << " Status=0x" << (int)status << std::dec;
+
+        if (status == 0x00) {
+            std::cout << " (SUCCESS)" << std::endl;
+        } else {
+            std::cout << " (FAILED)" << std::endl;
+        }
 
         return (status == 0x00);
     }
 
     uint16_t get_raw_lux_value() {
         return last_raw_data.data[0] | (last_raw_data.data[1] << 8);
+    }
+
+    uint8_t get_raw_range() {
+        return last_raw_data.data[2];
     }
 
     uint16_t get_calibrated_lux_value() {
@@ -186,6 +221,45 @@ public:
 
     uint8_t get_sequence_counter() {
         return last_lux_data.data[3];
+    }
+
+    uint8_t get_current_range() {
+        return last_lux_data.data[4];
+    }
+
+    int recommend_range(uint16_t lux_value) {
+        for (int i = 0; i < 4; i++) {
+            if (lux_value >= range_info[i].optimal_min && lux_value <= range_info[i].optimal_max) {
+                return i;
+            }
+        }
+
+        for (int i = 0; i < 4; i++) {
+            if (lux_value >= range_info[i].min_lux && lux_value <= range_info[i].max_lux) {
+                return i;
+            }
+        }
+
+        if (lux_value < range_info[0].min_lux) return 0;
+        if (lux_value > range_info[3].max_lux) return 3;
+
+        return -1;
+    }
+
+    void show_range_recommendation(uint16_t lux_value) {
+        int recommended = recommend_range(lux_value);
+
+        if (recommended >= 0) {
+            std::cout << "[RECOMMENDATION] For " << lux_value << " lux, use: --reference-";
+            switch (recommended) {
+                case 0: std::cout << "low"; break;
+                case 1: std::cout << "medium"; break;
+                case 2: std::cout << "high"; break;
+                case 3: std::cout << "veryhigh"; break;
+            }
+            std::cout << "=" << lux_value << std::endl;
+            std::cout << "[INFO] " << range_names[recommended] << " range: " << range_info[recommended].description << std::endl;
+        }
     }
 
     void show_current_readings() {
@@ -211,7 +285,10 @@ public:
         std::cout << "[INFO] Reading raw sensor data (10 samples)..." << std::endl;
         std::cout << "[INFO] Press Ctrl+C to exit cleanly" << std::endl;
 
-        for (int i = 1; i <= 10; i++) {
+        uint16_t sample_values[20];
+        int valid_samples = 0;
+
+        for (int i = 1; i <= 20; i++) {
             if (interrupt_requested) {
                 std::cout << "[INFO] Interrupt received, exiting..." << std::endl;
                 break;
@@ -219,11 +296,29 @@ public:
 
             std::this_thread::sleep_for(std::chrono::milliseconds(1100));
             uint16_t lux = get_raw_lux_value();
-            std::cout << "[INFO] Sample " << i << ": " << lux << " lux" << std::endl;
+            uint8_t range = get_raw_range();
+            const char* range_name = (range < 4) ? range_names[range] : "UNKNOWN";
+
+            std::cout << "[INFO] Sample " << i << ": " << lux << " lux (Range: "
+                      << range_name << ")" << std::endl;
+
+            if (lux > 0 && lux < 65535 && valid_samples < 20) {
+                sample_values[valid_samples++] = lux;
+            }
         }
 
-        // Clean exit from calibration mode
-        std::cout << "[INFO] Exiting calibration mode..." << std::endl;
+        if (valid_samples > 0) {
+            uint32_t sum = 0;
+            for (int i = 0; i < valid_samples; i++) {
+                sum += sample_values[i];
+            }
+            uint16_t average = sum / valid_samples;
+
+            std::cout << "\n[ANALYSIS] Average reading: " << average << " lux" << std::endl;
+            show_range_recommendation(average);
+        }
+
+        std::cout << "\n[INFO] Exiting calibration mode..." << std::endl;
         send_command(CAL_CMD_EXIT);
         wait_for_response();
         check_response_status();
@@ -231,10 +326,9 @@ public:
     }
 
     void show_calibrated_readings() {
-        std::cout << "[INFO] Monitoring calibrated sensor readings (10 samples)..." << std::endl;
+        std::cout << "[INFO] Monitoring calibrated sensor readings (20 samples)..." << std::endl;
         std::cout << "[INFO] Waiting for fresh CAN data..." << std::endl;
 
-        // Wait for first fresh message and record its sequence number
         uint8_t last_sequence = get_sequence_counter();
         bool got_fresh_data = false;
 
@@ -252,12 +346,13 @@ public:
             return;
         }
 
-        for (int i = 1; i <= 10; i++) {
+        for (int i = 1; i <= 30; i++) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1100));
 
             uint16_t calibrated_lux = get_calibrated_lux_value();
             uint8_t status = get_sensor_status();
             uint8_t sequence = get_sequence_counter();
+            uint8_t range = get_current_range();
 
             const char* status_str = "UNKNOWN";
             switch (status) {
@@ -266,15 +361,64 @@ public:
                 case 0x02: status_str = "CALIBRATING"; break;
             }
 
+            const char* range_name = (range < 4) ? range_names[range] : "UNKNOWN";
+
             std::cout << "[INFO] Sample " << i << ": " << calibrated_lux << " lux "
-                      << "(status=" << status_str << ", seq=" << (int)sequence << ")" << std::endl;
+                      << "(status=" << status_str << ", seq=" << (int)sequence
+                      << ", range=" << range_name << ")" << std::endl;
         }
     }
 
-    void calibrate(uint16_t reference_lux, bool verify = false) {
-        std::cout << "[INFO] Starting calibration with reference: " << reference_lux << " lux" << std::endl;
+    bool validate_range_value(uint8_t range_cmd, uint16_t reference_lux, const char* range_name) {
+        int range_idx = -1;
+        switch (range_cmd) {
+            case CAL_CMD_SET_REF_LOW: range_idx = 0; break;
+            case CAL_CMD_SET_REF_MED: range_idx = 1; break;
+            case CAL_CMD_SET_REF_HIGH: range_idx = 2; break;
+            case CAL_CMD_SET_REF_VERYHIGH: range_idx = 3; break;
+            default: return false;
+        }
 
-        // Enter calibration mode
+        const RangeInfo& info = range_info[range_idx];
+
+        if (reference_lux < info.min_lux || reference_lux > info.max_lux) {
+            std::cerr << "[ERROR] " << range_name << " range value " << reference_lux
+                      << " lux is outside acceptable range (" << info.min_lux
+                      << "-" << info.max_lux << " lux)" << std::endl;
+            std::cerr << "[INFO] " << range_name << " range is for: " << info.description << std::endl;
+            return false;
+        }
+
+        if (reference_lux < info.optimal_min || reference_lux > info.optimal_max) {
+            std::cout << "[WARNING] " << reference_lux << " lux is acceptable but not optimal for "
+                      << range_name << " range" << std::endl;
+            std::cout << "[INFO] Optimal range: " << info.optimal_min << "-" << info.optimal_max
+                      << " lux" << std::endl;
+
+            int better_range = recommend_range(reference_lux);
+            if (better_range != range_idx && better_range >= 0) {
+                std::cout << "[SUGGESTION] Consider using --reference-";
+                switch (better_range) {
+                    case 0: std::cout << "low"; break;
+                    case 1: std::cout << "medium"; break;
+                    case 2: std::cout << "high"; break;
+                    case 3: std::cout << "veryhigh"; break;
+                }
+                std::cout << "=" << reference_lux << " instead" << std::endl;
+            }
+        }
+
+        return true;
+    }
+
+    void calibrate_range(uint8_t range_cmd, const char* range_name, uint16_t reference_lux, bool verify = false) {
+        if (!validate_range_value(range_cmd, reference_lux, range_name)) {
+            return;
+        }
+
+        std::cout << "[INFO] Starting " << range_name << " range calibration with reference: "
+                  << reference_lux << " lux" << std::endl;
+
         std::cout << "[INFO] Entering calibration mode..." << std::endl;
         if (!send_command(CAL_CMD_ENTER) || !wait_for_response() || !check_response_status()) {
             std::cerr << "[ERROR] Failed to enter calibration mode" << std::endl;
@@ -283,39 +427,39 @@ public:
 
         in_calibration_mode = true;
 
-        // Wait for sensor data and read current value
-        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
         uint16_t current_lux = get_raw_lux_value();
-        std::cout << "[INFO] Current sensor reading: " << current_lux << " lux" << std::endl;
+        uint8_t current_range = get_raw_range();
+
+        std::cout << "[INFO] Current sensor reading: " << current_lux << " lux (Range: "
+                  << ((current_range < 4) ? range_names[current_range] : "UNKNOWN") << ")" << std::endl;
         std::cout << "[INFO] Reference lux meter: " << reference_lux << " lux" << std::endl;
 
-        // Send reference value (little-endian)
+        int16_t expected_offset = reference_lux - current_lux;
+        std::cout << "[INFO] Expected offset: " << expected_offset << " lux" << std::endl;
+
         uint8_t ref_data[2] = {
             static_cast<uint8_t>(reference_lux & 0xFF),
             static_cast<uint8_t>((reference_lux >> 8) & 0xFF)
         };
 
-        std::cout << "[INFO] Setting reference value..." << std::endl;
-        if (!send_command(CAL_CMD_SET_REFERENCE, ref_data, 2) ||
+        std::cout << "[INFO] Setting " << range_name << " range reference value..." << std::endl;
+        if (!send_command(range_cmd, ref_data, 2) ||
             !wait_for_response() || !check_response_status()) {
-            std::cerr << "[ERROR] Failed to set reference value" << std::endl;
-            // Try to exit calibration mode on error
+            std::cerr << "[ERROR] Failed to set " << range_name << " range reference value" << std::endl;
             send_command(CAL_CMD_EXIT);
             in_calibration_mode = false;
             return;
         }
 
-        // Save calibration
         std::cout << "[INFO] Saving calibration..." << std::endl;
         if (!send_command(CAL_CMD_SAVE) || !wait_for_response() || !check_response_status()) {
             std::cerr << "[ERROR] Failed to save calibration" << std::endl;
-            // Try to exit calibration mode on error
             send_command(CAL_CMD_EXIT);
             in_calibration_mode = false;
             return;
         }
 
-        // Exit calibration mode
         std::cout << "[INFO] Exiting calibration mode..." << std::endl;
         if (!send_command(CAL_CMD_EXIT) || !wait_for_response() || !check_response_status()) {
             std::cerr << "[ERROR] Failed to exit calibration mode" << std::endl;
@@ -324,9 +468,8 @@ public:
 
         in_calibration_mode = false;
 
-        int16_t offset = reference_lux - current_lux;
-        std::cout << "[SUCCESS] Calibration completed!" << std::endl;
-        std::cout << "[INFO] Calculated offset: " << offset << " lux" << std::endl;
+        std::cout << "[SUCCESS] " << range_name << " range calibration completed!" << std::endl;
+        std::cout << "[INFO] Calculated offset: " << expected_offset << " lux" << std::endl;
 
         if (verify) {
             std::cout << "[INFO] Verifying calibration..." << std::endl;
@@ -335,56 +478,148 @@ public:
         }
     }
 
+    void calibrate(uint16_t reference_lux, bool verify = false) {
+        calibrate_range(CAL_CMD_SET_REFERENCE, "MEDIUM", reference_lux, verify);
+    }
+
+    void get_all_offsets() {
+        std::cout << "[INFO] Getting all calibration offsets..." << std::endl;
+
+        if (!send_command(CAL_CMD_GET_ALL_OFFSETS) || !wait_for_response() || !check_response_status()) {
+            std::cerr << "[ERROR] Failed to get offsets" << std::endl;
+            return;
+        }
+
+        float first_offset;
+        memcpy(&first_offset, &last_response.data[2], sizeof(float));
+        std::cout << "[INFO] First range (LOW) calibration offset: " << first_offset << " lux" << std::endl;
+        std::cout << "[INFO] Check ESP32 console logs for all 4 range offsets" << std::endl;
+    }
+
     void get_offset() {
-        std::cout << "[INFO] Getting current offset..." << std::endl;
+        std::cout << "[INFO] Getting current offset (legacy - medium range only)..." << std::endl;
 
         if (!send_command(CAL_CMD_GET_OFFSET) || !wait_for_response() || !check_response_status()) {
             std::cerr << "[ERROR] Failed to get offset" << std::endl;
             return;
         }
 
-        // Extract float from response data (bytes 2-5)
         float offset;
         memcpy(&offset, &last_response.data[2], sizeof(float));
-        std::cout << "[INFO] Current calibration offset: " << offset << " lux" << std::endl;
+        std::cout << "[INFO] Current calibration offset (medium range): " << offset << " lux" << std::endl;
     }
 
     void reset_calibration() {
-        std::cout << "[INFO] Resetting calibration to factory defaults..." << std::endl;
+        std::cout << "[INFO] Resetting ALL calibration ranges to factory defaults..." << std::endl;
 
         if (!send_command(CAL_CMD_RESET) || !wait_for_response() || !check_response_status()) {
             std::cerr << "[ERROR] Failed to reset calibration" << std::endl;
             return;
         }
 
-        std::cout << "[SUCCESS] Calibration reset to factory defaults (offset = 0.0 lux)" << std::endl;
-        std::cout << "[INFO] Sensor will now report uncalibrated raw values" << std::endl;
+        std::cout << "[SUCCESS] All calibration ranges reset to factory defaults (offset = 0.0 lux)" << std::endl;
+        std::cout << "[INFO] Sensor will now report uncalibrated raw values for all ranges" << std::endl;
+    }
+
+    void calibration_wizard() {
+        std::cout << "=== 4-Range Calibration Wizard ===" << std::endl;
+        std::cout << "This will guide you through calibrating all 4 light ranges." << std::endl;
+        std::cout << "You'll need to adjust lighting and use your reference lux meter." << std::endl;
+        std::cout << std::endl;
+
+        for (int i = 0; i < 4; i++) {
+            std::cout << "Range " << (i+1) << " (" << range_names[i] << "): "
+                      << range_info[i].description << std::endl;
+            std::cout << "  Optimal: " << range_info[i].optimal_min << "-"
+                      << range_info[i].optimal_max << " lux" << std::endl;
+        }
+
+        std::cout << "\nPress Enter to start, or Ctrl+C to abort..." << std::endl;
+        std::cin.get();
+
+        std::cout << "\nStep 1: LOW Range (" << range_info[0].optimal_min << "-"
+                  << range_info[0].optimal_max << " lux)" << std::endl;
+        std::cout << "- " << range_info[0].description << std::endl;
+        std::cout << "- Measure with your reference lux meter" << std::endl;
+        std::cout << "- Enter the measured value and press Enter: ";
+
+        uint16_t low_ref;
+        std::cin >> low_ref;
+        calibrate_range(0x07, "LOW", low_ref);
+
+        std::cout << "\nStep 2: MEDIUM Range (" << range_info[1].optimal_min << "-"
+                  << range_info[1].optimal_max << " lux)" << std::endl;
+        std::cout << "- " << range_info[1].description << std::endl;
+        std::cout << "- Enter the measured value and press Enter: ";
+
+        uint16_t med_ref;
+        std::cin >> med_ref;
+        calibrate_range(0x08, "MEDIUM", med_ref);
+
+        std::cout << "\nStep 3: HIGH Range (" << range_info[2].optimal_min << "-"
+                  << range_info[2].optimal_max << " lux)" << std::endl;
+        std::cout << "- " << range_info[2].description << std::endl;
+        std::cout << "- Enter the measured value and press Enter: ";
+
+        uint16_t high_ref;
+        std::cin >> high_ref;
+        calibrate_range(0x09, "HIGH", high_ref);
+
+        std::cout << "\nStep 4: VERY HIGH Range (" << range_info[3].optimal_min << "-"
+                  << range_info[3].optimal_max << " lux)" << std::endl;
+        std::cout << "- " << range_info[3].description << std::endl;
+        std::cout << "- Enter the measured value and press Enter: ";
+
+        uint16_t vhigh_ref;
+        std::cin >> vhigh_ref;
+        calibrate_range(0x0A, "VERY_HIGH", vhigh_ref);
+
+        std::cout << "\n=== Calibration Complete! ===" << std::endl;
+        std::cout << "All 4 ranges have been calibrated." << std::endl;
+        std::cout << "The sensor will now automatically switch between ranges." << std::endl;
+
+        std::cout << "\nVerification readings:" << std::endl;
+        show_calibrated_readings();
     }
 };
 
 void print_usage(const char* program_name) {
-    std::cout << "ESP32-C6 Lux Sensor Calibration Tool (C++)" << std::endl;
+    std::cout << "ESP32-C6 Lux Sensor 4-Range Calibration Tool (C++)" << std::endl;
     std::cout << std::endl;
     std::cout << "Usage: " << program_name << " [OPTIONS]" << std::endl;
     std::cout << std::endl;
-    std::cout << "Options:" << std::endl;
-    std::cout << "  --reference=VALUE    Calibrate using reference lux meter value" << std::endl;
-    std::cout << "  --verify            Verify calibration after setting" << std::endl;
-    std::cout << "  --show-current      Display raw sensor readings (calibration mode)" << std::endl;
-    std::cout << "  --show-calibrated   Display calibrated sensor readings (normal mode)" << std::endl;
-    std::cout << "  --get-offset        Show current calibration offset" << std::endl;
-    std::cout << "  --reset-calibration Reset calibration to factory defaults (offset=0)" << std::endl;
-    std::cout << "  --help              Show this help message" << std::endl;
+    std::cout << "4-Range Calibration Options:" << std::endl;
+    std::cout << "  --reference-low=VALUE      Calibrate LOW range (1-50 lux, optimal: 5-35)" << std::endl;
+    std::cout << "  --reference-medium=VALUE   Calibrate MEDIUM range (10-350 lux, optimal: 20-250)" << std::endl;
+    std::cout << "  --reference-high=VALUE     Calibrate HIGH range (100-1200 lux, optimal: 200-800)" << std::endl;
+    std::cout << "  --reference-veryhigh=VALUE Calibrate VERY HIGH range (500-5000 lux, optimal: 800-2000)" << std::endl;
+    std::cout << "  --wizard                   Interactive 4-step calibration wizard" << std::endl;
+    std::cout << "  --get-all-offsets          Show all 4 range calibration offsets" << std::endl;
+    std::cout << std::endl;
+    std::cout << "Legacy Options (for backward compatibility):" << std::endl;
+    std::cout << "  --reference=VALUE          Calibrate using reference lux meter value (medium range)" << std::endl;
+    std::cout << "  --get-offset               Show current calibration offset (medium range only)" << std::endl;
+    std::cout << std::endl;
+    std::cout << "General Options:" << std::endl;
+    std::cout << "  --verify                   Verify calibration after setting" << std::endl;
+    std::cout << "  --show-current             Display raw sensor readings with range recommendations" << std::endl;
+    std::cout << "  --show-calibrated          Display calibrated sensor readings (normal mode)" << std::endl;
+    std::cout << "  --reset-calibration        Reset ALL calibration ranges to factory defaults" << std::endl;
+    std::cout << "  --help                     Show this help message" << std::endl;
     std::cout << std::endl;
     std::cout << "Examples:" << std::endl;
-    std::cout << "  " << program_name << " --reference=102" << std::endl;
-    std::cout << "  " << program_name << " --reference=250 --verify" << std::endl;
-    std::cout << "  " << program_name << " --show-current" << std::endl;
-    std::cout << "  " << program_name << " --show-calibrated" << std::endl;
-    std::cout << "  " << program_name << " --reset-calibration" << std::endl;
+    std::cout << "  " << program_name << " --show-current          # Shows readings and recommends correct range" << std::endl;
+    std::cout << "  " << program_name << " --reference-high=1118   # Correct for your 1118 lux case" << std::endl;
+    std::cout << "  " << program_name << " --wizard               # Guided calibration" << std::endl;
+    std::cout << "  " << program_name << " --reset-calibration    # Start fresh" << std::endl;
+    std::cout << std::endl;
+    std::cout << "Range Selection Guide:" << std::endl;
+    std::cout << "  LOW (5-35 lux):      Very dim (night, parking lights)" << std::endl;
+    std::cout << "  MEDIUM (20-250 lux): Normal indoor lighting" << std::endl;
+    std::cout << "  HIGH (200-800 lux):  Bright indoor to daylight" << std::endl;
+    std::cout << "  V_HIGH (800+ lux):   Direct sunlight, very bright conditions" << std::endl;
 }
 
-// Signal handler for clean exit
 void signal_handler(int signum) {
     std::cout << "\n[INFO] Received signal " << signum << ", cleaning up..." << std::endl;
 
@@ -397,9 +632,8 @@ void signal_handler(int signum) {
 }
 
 int main(int argc, char* argv[]) {
-    // Install signal handler for clean exit
-    signal(SIGINT, signal_handler);   // Ctrl+C
-    signal(SIGTERM, signal_handler);  // Terminate signal
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
 
     CANCalibrator calibrator;
 
@@ -409,16 +643,20 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Start listening thread
     std::thread listener(&CANCalibrator::listen_thread, &calibrator);
 
-    // Parse arguments
     bool show_current = false;
     bool show_calibrated = false;
     bool get_offset = false;
+    bool get_all_offsets = false;
     bool reset_calibration = false;
     bool verify = false;
+    bool wizard = false;
     uint16_t reference_lux = 0;
+    uint16_t reference_low = 0;
+    uint16_t reference_medium = 0;
+    uint16_t reference_high = 0;
+    uint16_t reference_veryhigh = 0;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -429,12 +667,24 @@ int main(int argc, char* argv[]) {
             show_calibrated = true;
         } else if (arg == "--get-offset") {
             get_offset = true;
+        } else if (arg == "--get-all-offsets") {
+            get_all_offsets = true;
         } else if (arg == "--reset-calibration") {
             reset_calibration = true;
         } else if (arg == "--verify") {
             verify = true;
+        } else if (arg == "--wizard") {
+            wizard = true;
         } else if (arg.substr(0, 12) == "--reference=") {
             reference_lux = std::stoi(arg.substr(12));
+        } else if (arg.substr(0, 16) == "--reference-low=") {
+            reference_low = std::stoi(arg.substr(16));
+        } else if (arg.substr(0, 19) == "--reference-medium=") {
+            reference_medium = std::stoi(arg.substr(19));
+        } else if (arg.substr(0, 17) == "--reference-high=") {
+            reference_high = std::stoi(arg.substr(17));
+        } else if (arg.substr(0, 21) == "--reference-veryhigh=") {
+            reference_veryhigh = std::stoi(arg.substr(21));
         } else if (arg == "--help") {
             print_usage(argv[0]);
             calibrator.running = false;
@@ -450,15 +700,28 @@ int main(int argc, char* argv[]) {
     }
 
     // Execute commands
-    if (show_current) {
+    if (wizard) {
+        calibrator.calibration_wizard();
+    } else if (show_current) {
         calibrator.show_current_readings();
     } else if (show_calibrated) {
         calibrator.show_calibrated_readings();
     } else if (get_offset) {
         calibrator.get_offset();
+    } else if (get_all_offsets) {
+        calibrator.get_all_offsets();
     } else if (reset_calibration) {
         calibrator.reset_calibration();
+    } else if (reference_low > 0) {
+        calibrator.calibrate_range(0x07, "LOW", reference_low, verify);
+    } else if (reference_medium > 0) {
+        calibrator.calibrate_range(0x08, "MEDIUM", reference_medium, verify);
+    } else if (reference_high > 0) {
+        calibrator.calibrate_range(0x09, "HIGH", reference_high, verify);
+    } else if (reference_veryhigh > 0) {
+        calibrator.calibrate_range(0x0A, "VERY_HIGH", reference_veryhigh, verify);
     } else if (reference_lux > 0) {
+        // Legacy calibration
         if (reference_lux < 1 || reference_lux > 10000) {
             std::cerr << "[ERROR] Reference value must be between 1 and 10000 lux" << std::endl;
             calibrator.running = false;
