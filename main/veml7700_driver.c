@@ -185,28 +185,7 @@ static float moving_avg_update(moving_avg_filter_t *filter, float new_value) {
 
 /* ======================== I2C Communication ======================== */
 
-static esp_err_t i2c_master_init(void) {
-    i2c_config_t conf = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = I2C_SDA_GPIO_NUM,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_io_num = I2C_SCL_GPIO_NUM,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = I2C_MASTER_FREQ_HZ,
-    };
-
-    esp_err_t err = i2c_param_config(I2C_MASTER_NUM, &conf);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "I2C param config failed: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    err = i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "I2C driver install failed: %s", esp_err_to_name(err));
-    }
-    return err;
-}
+/* Note: I2C initialization is handled by als_driver.c */
 
 static esp_err_t veml7700_write_reg(uint8_t reg, uint16_t data) {
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
@@ -414,18 +393,14 @@ esp_err_t veml7700_init(void) {
         return ESP_OK;
     }
 
-    /* Initialize I2C */
-    esp_err_t ret = i2c_master_init();
-    if (ret != ESP_OK) {
-        return ret;
-    }
+    /* Note: I2C bus is initialized by als_driver.c before calling this function */
 
     /* Initialize filter and state */
     moving_avg_init(&lux_filter);
     memset(&range_state, 0, sizeof(range_state));
 
     /* Set initial configuration */
-    ret = veml7700_set_config(current_config_idx);
+    esp_err_t ret = veml7700_set_config(current_config_idx);
     if (ret == ESP_OK) {
         initialized = true;
         ESP_LOGI(TAG, "Initialized successfully");

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Summary
 
-ESP32-C3/C6 automotive CAN node with VEML7700 ambient light sensor. Production-ready implementation featuring intelligent auto-ranging, moving average filtering, and a CAN-based calibration system. Modular architecture with queue-based sensor data flow, designed for multi-sensor expansion.
+ESP32-C3/C6 automotive CAN node with ambient light sensor support. Production-ready implementation with runtime auto-detection supporting both **VEML7700** (0-120K lux, calibrated) and **OPT4001** (0-2.2M lux, factory calibrated) sensors. Features intelligent auto-ranging, moving average filtering, and modular queue-based architecture designed for multi-sensor expansion.
 
 ## Build and Development Commands
 
@@ -87,12 +87,25 @@ main/
 │   ├── sensor_data_t: Unified sensor data union
 │   └── Status codes and constants
 │
+├── als_driver.c/h (~150 lines) - Ambient Light Sensor abstraction layer
+│   ├── Runtime auto-detection (I2C address probing)
+│   ├── Unified API for VEML7700 or OPT4001
+│   ├── I2C bus initialization
+│   └── Sensor type identification via config index
+│
 ├── veml7700_driver.c/h (~550 lines) - VEML7700 sensor module
 │   ├── I2C communication functions
 │   ├── Configuration table (21 configs: gain × integration time)
 │   ├── Intelligent auto-ranging algorithm with saturation ramp-up
 │   ├── Moving average filter (8 samples)
 │   └── Calibration correction (piecewise linear, 0-120K lux range)
+│
+├── opt4001_driver.c/h (~230 lines) - OPT4001 sensor module
+│   ├── I2C communication (big-endian)
+│   ├── Hardware auto-ranging (12 ranges, 0-11)
+│   ├── 800ms integration time (highest accuracy)
+│   ├── Factory-calibrated (SOT-5x3 package)
+│   └── No filtering needed (stable readings)
 │
 └── can_protocol.c/h (~160 lines) - CAN message formatting
     ├── Message ID definitions
@@ -161,6 +174,40 @@ main/
 - Calibrated against reference lux meter at 70K lux (±1.4% accuracy)
 - Persistent storage via NVS (future enhancement)
 
+### Ambient Light Sensor Support
+
+The firmware supports two ambient light sensors with **runtime auto-detection**:
+
+**VEML7700** (I2C address 0x10):
+- **Range:** 0-120,000 lux
+- **Auto-ranging:** 21 software configurations (gain × integration time)
+- **Calibration:** Piecewise linear correction for diffuser dome
+- **Accuracy:** ±1.4% @ 70K lux (vs reference meter)
+- **Best for:** Applications requiring calibrated measurements across full range
+- **Config index:** 0-20 (reported in CAN messages)
+
+**OPT4001** (I2C address 0x44):
+- **Range:** 0-2,200,000 lux (2.2M lux)
+- **Auto-ranging:** 12 hardware ranges (managed by sensor)
+- **Calibration:** Factory calibrated (SOT-5x3 package: 0.0004375 LSB)
+- **Accuracy:** ±1.5% @ 870 lux (vs reference meter)
+- **Integration time:** 800ms (highest accuracy)
+- **Best for:** Wide dynamic range applications, direct sunlight measurement
+- **Config index:** 100-111 (range 0-11 + 100 offset)
+
+**Auto-Detection Logic** [als_driver.c]:
+1. Initialize I2C bus
+2. Probe address 0x10 (VEML7700)
+   - If found → initialize VEML7700 driver
+3. Probe address 0x44 (OPT4001)
+   - If found → initialize OPT4001 driver
+4. Use detected sensor transparently via unified API
+
+**Sensor Identification:**
+- CAN clients can identify sensor type via config index:
+  - Config 0-20 = VEML7700
+  - Config 100-111 = OPT4001
+
 ### CAN Protocol
 
 **Message IDs:**
@@ -176,7 +223,7 @@ main/
 Byte 0-2: Lux value (uint24_t, little-endian, 0-16,777,215)
 Byte 3:   Status (0x00=OK, 0x01=Error)
 Byte 4:   Sequence counter (rolls over)
-Byte 5:   Current config index (0-20, for debugging)
+Byte 5:   Current config index (0-20 for VEML7700, 100-111 for OPT4001)
 Byte 6-7: Checksum (sum of bytes 0-5, uint16_t LE)
 ```
 
@@ -185,17 +232,19 @@ Byte 6-7: Checksum (sum of bytes 0-5, uint16_t LE)
 ```
 GPIO4:  CAN TX
 GPIO5:  CAN RX
-GPIO6:  I2C SDA (VEML7700)
-GPIO7:  I2C SCL (VEML7700)
+GPIO6:  I2C SDA (VEML7700 @ 0x10 OR OPT4001 @ 0x44)
+GPIO7:  I2C SCL (VEML7700 @ 0x10 OR OPT4001 @ 0x44)
 ```
+
+**Note:** Only one ambient light sensor should be connected at a time. The firmware automatically detects which sensor is present via I2C address probing.
 
 ### Resource Usage
 
-- **Flash:** ~55-65 KB (modular build)
-- **SRAM:** ~70 KB (out of 400 KB available)
+- **Flash:** ~220 KB (with OPT4001 + VEML7700 support)
+- **SRAM:** ~75 KB (out of 400 KB available)
 - **CPU Load:** <5% @ 160 MHz
 - **Task Stacks:**
-  - sensor_poll_task: 2 KB
+  - sensor_poll_task: 3 KB (increased for powf() in OPT4001 driver)
   - twai_transmit_task: 5 KB
   - twai_receive_task: 3 KB
   - twai_control_task: 2 KB (self-deletes after start)
@@ -216,6 +265,27 @@ GPIO7:  I2C SCL (VEML7700)
 3. **Filter modifications:** Maintain buffer size power-of-2 for efficiency
    - Current: 8 samples
    - Trade-off: larger = smoother but slower response
+
+### When Modifying OPT4001 Driver
+
+1. **I2C byte order:** OPT4001 uses **BIG ENDIAN** (MSB first)
+   - Write: MSB byte, then LSB byte
+   - Read: MSB byte, then LSB byte
+   - Different from many sensors!
+
+2. **Lux calculation constant:** Depends on package variant
+   - SOT-5x3: `0.0004375` (current implementation)
+   - PICOSTAR: `0.0003125`
+   - Formula: `lux = mantissa × 2^exponent × constant`
+
+3. **Register structure:** Result is split across two 16-bit registers
+   - Register 0x00 (MSB): bits[15:12]=exponent, bits[11:0]=mantissa[19:8]
+   - Register 0x01 (LSB): bits[15:8]=mantissa[7:0], bits[7:0]=counter+CRC
+   - Must read both registers to get full 20-bit mantissa
+
+4. **Testing:** Verify against reference lux meter
+   - Target accuracy: ±2% across range
+   - Test at: dim indoor (~100 lux), bright indoor (~1000 lux), outdoor (~10K+ lux)
 
 ### When Modifying CAN Protocol
 
@@ -276,22 +346,53 @@ See `EXPANSION_GUIDE.md` for detailed multi-sensor expansion plan (BME680, LD241
 - Ensure sensor and reference meter at same position/angle
 - Note: ±5% variance is normal due to diffuser properties and spectral differences
 
+**OPT4001 readings always zero:**
+- Check I2C byte order (must be BIG ENDIAN - MSB first)
+- Verify config register write succeeded (read back to confirm)
+- Check device ID read correctly (should be 0x121 after masking bits 11:0)
+- Ensure 900ms delay after config write (for first conversion)
+
+**OPT4001 readings don't match reference meter:**
+- Verify package constant: SOT-5x3 = 0.0004375, PICOSTAR = 0.0003125
+- Check formula: `lux = mantissa × 2^exponent × constant`
+- Compare raw register values (MSB/LSB) with reference implementation
+- Target accuracy: ±2% across range
+
+**Stack overflow in sensor_poll_task:**
+- OPT4001 uses `powf()` which requires more stack
+- Increase stack size to 3072 bytes minimum
+- Check in `main.c`: `xTaskCreate(sensor_poll_task, "SENSOR_POLL", 3072, ...)`
+
 ## Testing Checklist
 
 ### Unit Testing
 - [ ] I2C communication (read/write registers)
-- [ ] All 21 configurations apply correctly
+- [ ] Sensor auto-detection (VEML7700 @ 0x10, OPT4001 @ 0x44)
+- [ ] All 21 VEML7700 configurations apply correctly
+- [ ] OPT4001 device ID verification (0x121)
+- [ ] OPT4001 config register write/readback
 - [ ] Checksum calculation for CAN messages
-- [ ] Moving average filter output
+- [ ] Moving average filter output (VEML7700)
 - [ ] 3-byte lux encoding/decoding
 
-### Integration Testing
+### Integration Testing - VEML7700
 - [ ] Auto-ranging across 0-120,000 lux
 - [ ] Saturation ramp-up in bright light (watch for rapid 8→9→...→20 progression)
 - [ ] No oscillation between configs
-- [ ] START/STOP commands work
 - [ ] Smooth transitions: indoor (500 lux) → outdoor (70K lux)
 - [ ] Calibration accuracy vs reference meter (indoor and sunlight)
+- [ ] Config index 0-20 reported correctly in CAN messages
+
+### Integration Testing - OPT4001
+- [ ] Hardware auto-ranging across 0-2.2M lux
+- [ ] Accuracy vs reference meter: ±2% at 100 lux, 1K lux, 10K+ lux
+- [ ] Range transitions smooth (config 100-111)
+- [ ] Config index 100-111 reported correctly in CAN messages
+- [ ] No stack overflow with powf() usage
+
+### Integration Testing - Common
+- [ ] START/STOP commands work
+- [ ] Sensor type correctly identified from config index
 
 ### Reliability Testing
 - [ ] 24-hour continuous operation

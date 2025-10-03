@@ -10,7 +10,7 @@
 #include <driver/twai.h>
 
 #include "sensor_common.h"
-#include "veml7700_driver.h"
+#include "als_driver.h"
 #include "can_protocol.h"
 
 /* ======================== Configuration ======================== */
@@ -45,24 +45,24 @@ static void sensor_poll_task(void *arg) {
     while (1) {
         /* Always read and queue - let transmit task control when to send */
         {
-            /* Read VEML7700 */
-            msg.sensor_id = SENSOR_VEML7700;
+            /* Read ambient light sensor (VEML7700 or OPT4001) */
+            msg.sensor_id = SENSOR_VEML7700;  // Keep same ID for CAN compatibility
             msg.timestamp_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
-            if (veml7700_read_lux(&msg.data.veml.lux) == ESP_OK) {
+            if (als_read_lux(&msg.data.veml.lux) == ESP_OK) {
                 msg.status = SENSOR_STATUS_OK;
-                msg.data.veml.config_idx = veml7700_get_config_idx();
-                ESP_LOGD(TAG, "Read VEML7700: %.1f lux, config=%d",
-                         msg.data.veml.lux, msg.data.veml.config_idx);
+                msg.data.veml.config_idx = als_get_config_idx();
+                ESP_LOGD(TAG, "Read ALS (%s): %.1f lux, config=%d",
+                         als_get_sensor_name(), msg.data.veml.lux, msg.data.veml.config_idx);
             } else {
                 msg.status = SENSOR_STATUS_ERROR;
                 msg.data.veml.lux = 0.0f;
-                ESP_LOGW(TAG, "VEML7700 read failed");
+                ESP_LOGW(TAG, "ALS read failed");
             }
 
             /* Send to queue */
             if (xQueueSend(sensor_queue, &msg, 0) != pdTRUE) {
-                ESP_LOGW(TAG, "Sensor queue full, dropping VEML7700 reading");
+                ESP_LOGW(TAG, "Sensor queue full, dropping ALS reading");
             } else {
                 ESP_LOGD(TAG, "Queued sensor data");
             }
@@ -184,12 +184,12 @@ void app_main(void) {
     }
     ESP_LOGI(TAG, "Sensor queue created (depth: %d)", SENSOR_QUEUE_DEPTH);
 
-    /* Initialize VEML7700 sensor */
-    if (veml7700_init() != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize VEML7700");
+    /* Initialize ambient light sensor (auto-detect VEML7700 or OPT4001) */
+    if (als_init() != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize ambient light sensor");
         return;
     }
-    ESP_LOGI(TAG, "VEML7700 initialized successfully");
+    ESP_LOGI(TAG, "Ambient light sensor (%s) initialized successfully", als_get_sensor_name());
 
     /* Configure and start TWAI (CAN) */
     twai_general_config_t g_config = {
@@ -219,7 +219,7 @@ void app_main(void) {
     ESP_LOGI(TAG, "TWAI initialized at 500 kbps");
 
     /* Create tasks */
-    xTaskCreate(sensor_poll_task, "SENSOR_POLL", 2048, NULL, SENSOR_POLL_TASK_PRIO, NULL);
+    xTaskCreate(sensor_poll_task, "SENSOR_POLL", 3072, NULL, SENSOR_POLL_TASK_PRIO, NULL);
     xTaskCreate(twai_receive_task, "TWAI_RX", 3072, NULL, CAN_RX_TASK_PRIO, NULL);
     xTaskCreate(twai_transmit_task, "TWAI_TX", 5120, NULL, CAN_TX_TASK_PRIO, NULL);
     xTaskCreate(twai_control_task, "TWAI_CTRL", 2048, NULL, CAN_CTRL_TSK_PRIO, NULL);
@@ -233,10 +233,11 @@ void app_main(void) {
 
         /* Read current lux for status */
         float current_lux;
-        if (veml7700_read_lux(&current_lux) == ESP_OK) {
-            ESP_LOGI(TAG, "Status: %.1f lux, Config: %d, Queue: %d/%d, Heap: %d KB",
+        if (als_read_lux(&current_lux) == ESP_OK) {
+            ESP_LOGI(TAG, "Status: %s, %.1f lux, Config: %d, Queue: %d/%d, Heap: %d KB",
+                     als_get_sensor_name(),
                      current_lux,
-                     veml7700_get_config_idx(),
+                     als_get_config_idx(),
                      uxQueueMessagesWaiting(sensor_queue),
                      SENSOR_QUEUE_DEPTH,
                      esp_get_free_heap_size() / 1024);
