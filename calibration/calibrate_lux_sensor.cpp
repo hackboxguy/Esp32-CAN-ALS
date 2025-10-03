@@ -203,28 +203,31 @@ public:
         return (status == 0x00);
     }
 
-    uint16_t get_raw_lux_value() {
-        return last_raw_data.data[0] | (last_raw_data.data[1] << 8);
+    uint32_t get_raw_lux_value() {
+        return last_raw_data.data[0] | (last_raw_data.data[1] << 8) | (last_raw_data.data[2] << 16);
     }
 
     uint8_t get_raw_range() {
-        return last_raw_data.data[2];
+        return last_raw_data.data[3];
     }
 
-    uint16_t get_calibrated_lux_value() {
-        return last_lux_data.data[0] | (last_lux_data.data[1] << 8);
+    uint32_t get_calibrated_lux_value() {
+        // Parse 3-byte (24-bit) lux value from bytes 0-2
+        return last_lux_data.data[0] |
+               (last_lux_data.data[1] << 8) |
+               (last_lux_data.data[2] << 16);
     }
 
     uint8_t get_sensor_status() {
-        return last_lux_data.data[2];
-    }
-
-    uint8_t get_sequence_counter() {
         return last_lux_data.data[3];
     }
 
-    uint8_t get_current_range() {
+    uint8_t get_sequence_counter() {
         return last_lux_data.data[4];
+    }
+
+    uint8_t get_current_range() {
+        return last_lux_data.data[5];
     }
 
     int recommend_range(uint16_t lux_value) {
@@ -285,7 +288,7 @@ public:
         std::cout << "[INFO] Reading raw sensor data (10 samples)..." << std::endl;
         std::cout << "[INFO] Press Ctrl+C to exit cleanly" << std::endl;
 
-        uint16_t sample_values[20];
+        uint32_t sample_values[20];
         int valid_samples = 0;
 
         for (int i = 1; i <= 20; i++) {
@@ -295,24 +298,24 @@ public:
             }
 
             std::this_thread::sleep_for(std::chrono::milliseconds(1100));
-            uint16_t lux = get_raw_lux_value();
+            uint32_t lux = get_raw_lux_value();
             uint8_t range = get_raw_range();
             const char* range_name = (range < 4) ? range_names[range] : "UNKNOWN";
 
             std::cout << "[INFO] Sample " << i << ": " << lux << " lux (Range: "
                       << range_name << ")" << std::endl;
 
-            if (lux > 0 && lux < 65535 && valid_samples < 20) {
+            if (lux > 0 && lux < 16777215 && valid_samples < 20) {
                 sample_values[valid_samples++] = lux;
             }
         }
 
         if (valid_samples > 0) {
-            uint32_t sum = 0;
+            uint64_t sum = 0;
             for (int i = 0; i < valid_samples; i++) {
                 sum += sample_values[i];
             }
-            uint16_t average = sum / valid_samples;
+            uint32_t average = sum / valid_samples;
 
             std::cout << "\n[ANALYSIS] Average reading: " << average << " lux" << std::endl;
             show_range_recommendation(average);
@@ -349,7 +352,7 @@ public:
         for (int i = 1; i <= 30; i++) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1100));
 
-            uint16_t calibrated_lux = get_calibrated_lux_value();
+            uint32_t calibrated_lux = get_calibrated_lux_value();
             uint8_t status = get_sensor_status();
             uint8_t sequence = get_sequence_counter();
             uint8_t range = get_current_range();
@@ -428,14 +431,14 @@ public:
         in_calibration_mode = true;
 
         std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-        uint16_t current_lux = get_raw_lux_value();
+        uint32_t current_lux = get_raw_lux_value();
         uint8_t current_range = get_raw_range();
 
         std::cout << "[INFO] Current sensor reading: " << current_lux << " lux (Range: "
                   << ((current_range < 4) ? range_names[current_range] : "UNKNOWN") << ")" << std::endl;
         std::cout << "[INFO] Reference lux meter: " << reference_lux << " lux" << std::endl;
 
-        int16_t expected_offset = reference_lux - current_lux;
+        int32_t expected_offset = reference_lux - current_lux;
         std::cout << "[INFO] Expected offset: " << expected_offset << " lux" << std::endl;
 
         uint8_t ref_data[2] = {

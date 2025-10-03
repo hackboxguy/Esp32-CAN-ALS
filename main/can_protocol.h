@@ -29,11 +29,10 @@
  * @brief Format VEML7700 lux sensor data into CAN message
  *
  * Message format (8 bytes):
- *   Byte 0-1: Lux value (uint16_t, little-endian, 0-65535)
- *   Byte 2:   Sensor status (0x00=OK, 0x01=Error)
- *   Byte 3:   Sequence counter (0-255, rolls over)
- *   Byte 4:   Current config index (0-17)
- *   Byte 5:   Reserved (0x00)
+ *   Byte 0-2: Lux value (uint24_t, little-endian, 0-16,777,215)
+ *   Byte 3:   Sensor status (0x00=OK, 0x01=Error)
+ *   Byte 4:   Sequence counter (0-255, rolls over)
+ *   Byte 5:   Current config index (0-20)
  *   Byte 6-7: Checksum (sum of bytes 0-5, uint16_t LE)
  *
  * @param[in] data Sensor data structure

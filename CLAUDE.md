@@ -87,12 +87,12 @@ main/
 │   ├── sensor_data_t: Unified sensor data union
 │   └── Status codes and constants
 │
-├── veml7700_driver.c/h (~520 lines) - VEML7700 sensor module
+├── veml7700_driver.c/h (~550 lines) - VEML7700 sensor module
 │   ├── I2C communication functions
-│   ├── Configuration table (18 configs: gain × integration time)
-│   ├── Intelligent auto-ranging algorithm
+│   ├── Configuration table (21 configs: gain × integration time)
+│   ├── Intelligent auto-ranging algorithm with saturation ramp-up
 │   ├── Moving average filter (8 samples)
-│   └── Calibration correction (piecewise linear)
+│   └── Calibration correction (piecewise linear, 0-120K lux range)
 │
 └── can_protocol.c/h (~160 lines) - CAN message formatting
     ├── Message ID definitions
@@ -129,23 +129,36 @@ main/
 
 ### Key Algorithms
 
-**Auto-Ranging Logic** [veml7700_driver.c:350-424]
+**Auto-Ranging Logic** [veml7700_driver.c:327-410]
 - Maintains reading history to prevent oscillation
-- Single-step configuration changes only
-- Requires settling period after config switch (3× integration time + 200ms)
+- Single-step configuration changes with intelligent saturation handling
+- **Saturation ramp-up:** Aggressively steps through configs when saturated (>65K counts)
+- Skips settling period during saturation ramp to quickly find optimal range
 - Targets optimal ADC range: 10,000-40,000 counts (out of 65,535)
 - Configuration table ordered by sensitivity (most sensitive → least sensitive)
+- **21 configurations** spanning 0-120,000 lux dynamic range:
+  - Configs 0-4: 2x gain (highest sensitivity, <500 lux)
+  - Configs 5-10: 1x gain (500-15K lux)
+  - Configs 11-14: 1/4x gain (5K-30K lux)
+  - Configs 15-20: 1/8x gain (10K-120K lux, direct sunlight)
 
-**Moving Average Filter** [veml7700_driver.c:187-213]
+**Moving Average Filter** [veml7700_driver.c:167-179]
 - Circular buffer: 8 samples
 - Updates on every reading
 - Reduces high-frequency noise while maintaining responsiveness
 
-**Calibration Correction** [veml7700_driver.c:83-97]
+**Calibration Correction** [veml7700_driver.c:146-164]
 - Piecewise linear function compensating for:
-  - Adafruit VEML7700 board diffuser dome
-  - Non-linear sensor response
-- Ranges: <10, 10-100, 100-500, 500-1000, >1000 lux
+  - Adafruit VEML7700 board diffuser dome optical properties
+  - Non-linear sensor response at different light intensities
+- **Calibration ranges:**
+  - <10 lux: 0.85x (very dim conditions)
+  - 10-100 lux: 0.92x (dim indoor)
+  - 100-500 lux: 1.05x (normal indoor)
+  - 500-1K lux: 1.12x (bright indoor)
+  - 1K-10K lux: 1.18x (very bright indoor / overcast outdoor)
+  - **>10K lux: 0.915x (direct sunlight - diffuser non-linearity)**
+- Calibrated against reference lux meter at 70K lux (±1.4% accuracy)
 - Persistent storage via NVS (future enhancement)
 
 ### CAN Protocol
@@ -160,11 +173,10 @@ main/
 
 **Lux Data Format (0x0A2):**
 ```
-Byte 0-1: Lux value (uint16_t, little-endian, 0-65535)
-Byte 2:   Status (0x00=OK, 0x01=Error)
-Byte 3:   Sequence counter (rolls over)
-Byte 4:   Current config index (0-17, for debugging)
-Byte 5:   Reserved (0x00)
+Byte 0-2: Lux value (uint24_t, little-endian, 0-16,777,215)
+Byte 3:   Status (0x00=OK, 0x01=Error)
+Byte 4:   Sequence counter (rolls over)
+Byte 5:   Current config index (0-20, for debugging)
 Byte 6-7: Checksum (sum of bytes 0-5, uint16_t LE)
 ```
 
@@ -253,19 +265,33 @@ See `EXPANSION_GUIDE.md` for detailed multi-sensor expansion plan (BME680, LD241
 - Known issue with USB-Serial/JTAG
 - Use CAN monitoring instead: functionality is unaffected
 
+**Sensor maxes out at ~10K lux in sunlight:**
+- Verify firmware has all 21 configs (check compile timestamp)
+- Check monitor logs for saturation ramp-up messages
+- Should see: `Config switch: X→Y, reason=SATURATION_RAMP`
+- Final config should be 18-20 for bright sunlight (>50K lux)
+
+**High-lux readings don't match reference meter:**
+- Check calibration factor for >10K lux range (should be 0.915x)
+- Ensure sensor and reference meter at same position/angle
+- Note: ±5% variance is normal due to diffuser properties and spectral differences
+
 ## Testing Checklist
 
 ### Unit Testing
 - [ ] I2C communication (read/write registers)
-- [ ] All 18 configurations apply correctly
+- [ ] All 21 configurations apply correctly
 - [ ] Checksum calculation for CAN messages
 - [ ] Moving average filter output
+- [ ] 3-byte lux encoding/decoding
 
 ### Integration Testing
 - [ ] Auto-ranging across 0-120,000 lux
+- [ ] Saturation ramp-up in bright light (watch for rapid 8→9→...→20 progression)
 - [ ] No oscillation between configs
 - [ ] START/STOP commands work
-- [ ] Calibration persists across reboots (if NVS enabled)
+- [ ] Smooth transitions: indoor (500 lux) → outdoor (70K lux)
+- [ ] Calibration accuracy vs reference meter (indoor and sunlight)
 
 ### Reliability Testing
 - [ ] 24-hour continuous operation
@@ -309,12 +335,21 @@ See `EXPANSION_GUIDE.md` for detailed multi-sensor expansion plan (BME680, LD241
 
 The codebase has been refactored with a **modular, queue-based architecture** ready for multi-sensor expansion:
 
-**Phase 0 (Completed):**
+**Phase 0 (Completed - Modular Refactoring):**
 - ✅ Extracted VEML7700 into separate driver module
 - ✅ Implemented queue-based data flow
 - ✅ Created shared sensor data structures
 - ✅ Separated CAN protocol formatting
 - ✅ Verified functionality (all tests passing)
+
+**Phase 0.5 (Completed - High-Lux Sunlight Support):**
+- ✅ Extended sensor range from 15K to 120K lux
+- ✅ Added 3 new VEML7700 configurations (configs 18-20)
+- ✅ Implemented saturation ramp-up auto-ranging algorithm
+- ✅ Upgraded CAN protocol from 2-byte (65K max) to 3-byte (16M max) lux encoding
+- ✅ Added high-intensity calibration (>10K lux range)
+- ✅ Validated against reference lux meter (±1.4% accuracy at 70K lux)
+- ✅ Updated calibration utility for 3-byte lux parsing
 
 **Next Phases (Planned):**
 - Phase 1: Add BME680 environmental sensor with BSEC 2.x

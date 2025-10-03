@@ -22,16 +22,18 @@ void can_format_veml7700_message(const sensor_data_t *data, uint8_t sequence, tw
     msg->flags = TWAI_MSG_FLAG_NONE;
     msg->data_length_code = 8;
 
-    /* Lux value (uint16_t, clamped to 0-65535) */
-    uint16_t lux_int = (uint16_t)(data->data.veml.lux > 65535.0f ? 65535 : data->data.veml.lux);
-    msg->data[0] = lux_int & 0xFF;
-    msg->data[1] = (lux_int >> 8) & 0xFF;
+    /* Lux value (uint24_t, 3 bytes, 0-16,777,215 lux) */
+    uint32_t lux_int = (uint32_t)(data->data.veml.lux);
+    if (lux_int > 0xFFFFFF) lux_int = 0xFFFFFF;  /* Clamp to 24-bit max */
+
+    msg->data[0] = lux_int & 0xFF;          /* Lux low byte */
+    msg->data[1] = (lux_int >> 8) & 0xFF;   /* Lux mid byte */
+    msg->data[2] = (lux_int >> 16) & 0xFF;  /* Lux high byte */
 
     /* Status, sequence, config index */
-    msg->data[2] = data->status;
-    msg->data[3] = sequence;
-    msg->data[4] = data->data.veml.config_idx;
-    msg->data[5] = 0x00;  /* Reserved */
+    msg->data[3] = data->status;
+    msg->data[4] = sequence;
+    msg->data[5] = data->data.veml.config_idx;
 
     /* Checksum (bytes 0-5) */
     uint16_t checksum = calculate_checksum(msg->data, 6);

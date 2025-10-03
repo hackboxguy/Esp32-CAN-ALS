@@ -71,6 +71,7 @@ typedef struct {
     int history_count;
     int readings_since_change;
     bool range_change_pending;
+    bool last_switch_was_saturation;  // Track if last switch was due to saturation
 } range_switch_state_t;
 
 /* ======================== Configuration Table ======================== */
@@ -101,6 +102,9 @@ static const SensorConfig g_configs[] = {
     {VEML7700_GAIN_1_8X, VEML7700_IT_800MS, 0.125f, 800.0f, 0.0576f},
     {VEML7700_GAIN_1_8X, VEML7700_IT_400MS, 0.125f, 400.0f, 0.1152f},
     {VEML7700_GAIN_1_8X, VEML7700_IT_200MS, 0.125f, 200.0f, 0.2304f},
+    {VEML7700_GAIN_1_8X, VEML7700_IT_100MS, 0.125f, 100.0f, 0.4608f},  // ~30K lux max
+    {VEML7700_GAIN_1_8X, VEML7700_IT_50MS,  0.125f, 50.0f,  0.9216f},  // ~60K lux max
+    {VEML7700_GAIN_1_8X, VEML7700_IT_25MS,  0.125f, 25.0f,  1.8432f},  // ~120K lux max
 };
 
 #define NUM_CONFIGS (sizeof(g_configs) / sizeof(g_configs[0]))
@@ -142,15 +146,20 @@ static const char* sensor_config_it_str(const SensorConfig* config) {
 static float calibrate_lux(float raw_lux) {
     /* Piecewise linear calibration for Adafruit VEML7700 with diffuser dome */
     if (raw_lux < 10.0f) {
-        return raw_lux * 0.85f;
+        return raw_lux * 0.85f;         // Very dim (night, parking lights)
     } else if (raw_lux < 100.0f) {
-        return raw_lux * 0.92f;
+        return raw_lux * 0.92f;         // Dim indoor lighting
     } else if (raw_lux < 500.0f) {
-        return raw_lux * 1.05f;
+        return raw_lux * 1.05f;         // Normal indoor
     } else if (raw_lux < 1000.0f) {
-        return raw_lux * 1.12f;
+        return raw_lux * 1.12f;         // Bright indoor
+    } else if (raw_lux < 10000.0f) {
+        return raw_lux * 1.18f;         // Very bright indoor / overcast outdoor
     } else {
-        return raw_lux * 1.18f;
+        /* High intensity sunlight - diffuser non-linearity correction
+         * Calibrated against reference meter at 70K lux (measured 76.5K uncalibrated)
+         * Factor: 70000 / 76500 = 0.915 */
+        return raw_lux * 0.915f;        // Direct sunlight (10K-120K lux range)
     }
 }
 
@@ -324,25 +333,39 @@ static bool readings_consistently_low(void) {
 static int determine_optimal_config(uint16_t raw_counts) {
     update_reading_history(raw_counts);
 
-    /* Don't adjust immediately after configuration change */
-    if (range_state.readings_since_change < SETTLE_READINGS_REQUIRED) {
-        ESP_LOGD(TAG, "Settling after config change (%d/%d readings)",
-                 range_state.readings_since_change, SETTLE_READINGS_REQUIRED);
-        return current_config_idx;
-    }
-
     /* Determine if adjustment needed - SINGLE STEP ONLY */
     int adjustment = 0;
     const char* reason = "";
 
-    /* Critical thresholds - immediate action */
+    /* Critical thresholds - immediate action (even during settle period) */
     if (raw_counts >= SATURATED_HIGH || raw_counts >= 65000) {
         adjustment = 1;  // Less sensitive
         reason = raw_counts >= 64000 ? "SATURATED" : "TOO_HIGH";
+        range_state.last_switch_was_saturation = true;
+
+    /* During settle period after saturation switch, aggressively continue ramping */
+    } else if (range_state.readings_since_change < SETTLE_READINGS_REQUIRED &&
+               range_state.last_switch_was_saturation &&
+               raw_counts > OPTIMAL_LOW) {
+        /* We just switched due to saturation. Even if not reading super high now,
+         * the previous saturation means we're in very bright light.
+         * Continue stepping up to find the right range. */
+        adjustment = 1;
+        reason = "SATURATION_RAMP";
+        ESP_LOGI(TAG, "Continuing saturation ramp: raw=%u (settle %d/%d)",
+                 raw_counts, range_state.readings_since_change, SETTLE_READINGS_REQUIRED);
+
+    /* Normal settle period - wait before making decisions */
+    } else if (range_state.readings_since_change < SETTLE_READINGS_REQUIRED) {
+        ESP_LOGI(TAG, "Settling after config change (%d/%d readings), raw=%u",
+                 range_state.readings_since_change, SETTLE_READINGS_REQUIRED, raw_counts);
+        range_state.last_switch_was_saturation = false;  // Reset flag after settle
+        return current_config_idx;
 
     } else if (raw_counts < TOO_LOW && raw_counts > 0) {
         adjustment = -1;  // More sensitive
         reason = raw_counts < 500 ? "VERY_LOW" : "TOO_LOW";
+        range_state.last_switch_was_saturation = false;
 
     } else if (raw_counts >= OPTIMAL_LOW && raw_counts <= OPTIMAL_HIGH) {
         /* In optimal range - no change */
