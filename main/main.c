@@ -7,11 +7,17 @@
 #include <freertos/semphr.h>
 #include <freertos/queue.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <driver/twai.h>
 
 #include "sensor_common.h"
 #include "als_driver.h"
 #include "can_protocol.h"
+
+/* Conditional BME680 support */
+#ifdef CONFIG_BME680_ENABLED
+#include "bme680_bsec.h"
+#endif
 
 /* ======================== Configuration ======================== */
 
@@ -22,9 +28,17 @@
 #define CAN_RX_TASK_PRIO        9
 #define CAN_CTRL_TSK_PRIO       10
 #define SENSOR_POLL_TASK_PRIO   5
+#define BME680_TASK_PRIO        6  /* Between ALS and transmit */
 
 #define CAN_DATA_PERIOD_MS      1000
 #define SENSOR_QUEUE_DEPTH      20
+
+/* BME680 sample rate from Kconfig (default 3 seconds for LP mode) */
+#ifndef CONFIG_BME680_SAMPLE_RATE
+#define BME680_SAMPLE_RATE_SEC  3  /* BSEC LP mode: 3 seconds */
+#else
+#define BME680_SAMPLE_RATE_SEC  CONFIG_BME680_SAMPLE_RATE
+#endif
 
 static const char *TAG = "MULTI_SENSOR";
 
@@ -72,6 +86,68 @@ static void sensor_poll_task(void *arg) {
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(1000));
     }
 }
+
+/* ======================== BME680 Sensor Task ======================== */
+
+#ifdef CONFIG_BME680_ENABLED
+static void bme680_sensor_task(void *arg) {
+    sensor_data_t msg;
+    bme68x_data_t bme_data;
+
+    ESP_LOGI(TAG, "BME680 sensor task started (BSEC-driven timing)");
+
+    /* Get initial next_call time from BSEC */
+    uint64_t next_call_ms = bme680_get_next_call_ms();
+    ESP_LOGI(TAG, "First BSEC call scheduled at %llu ms", next_call_ms);
+
+    while (1) {
+        /* Wait until BSEC's next_call time (with 50ms buffer to ensure we're not early) */
+        uint64_t now_ms = esp_timer_get_time() / 1000;
+        uint64_t target_ms = next_call_ms + 50;  /* Add 50ms buffer */
+
+        if (target_ms > now_ms) {
+            uint32_t delay_ms = (uint32_t)(target_ms - now_ms);
+            ESP_LOGI(TAG, "Waiting %lu ms until BSEC call (next_call=%llu ms)", delay_ms, next_call_ms);
+            vTaskDelay(pdMS_TO_TICKS(delay_ms));
+        }
+
+        ESP_LOGI(TAG, "Attempting BME680 read at %llu ms", esp_timer_get_time() / 1000);
+
+        /* Read BME680 sensor */
+        msg.sensor_id = SENSOR_BME680;
+        msg.timestamp_ms = esp_timer_get_time() / 1000;
+
+        if (bme680_read(&bme_data) == ESP_OK) {
+            msg.status = SENSOR_STATUS_OK;
+
+            /* Copy data from BME68x structure to sensor_data_t */
+            msg.data.bme.temperature = bme_data.temperature;
+            msg.data.bme.humidity = bme_data.humidity;
+            msg.data.bme.pressure = bme_data.pressure;
+            msg.data.bme.iaq = bme_data.iaq;
+            msg.data.bme.accuracy = bme_data.accuracy;
+            msg.data.bme.co2_equiv = bme_data.co2_equiv;
+            msg.data.bme.breath_voc = bme_data.breath_voc;
+
+            ESP_LOGI(TAG, "BME680: T=%.1f°C, H=%.1f%%, P=%.1fhPa, IAQ=%d (acc=%d), CO2=%dppm, VOC=%dppm",
+                     bme_data.temperature, bme_data.humidity, bme_data.pressure,
+                     bme_data.iaq, bme_data.accuracy, bme_data.co2_equiv, bme_data.breath_voc);
+
+            /* Send to queue */
+            if (xQueueSend(sensor_queue, &msg, 0) != pdTRUE) {
+                ESP_LOGW(TAG, "Sensor queue full, dropping BME680 reading");
+            }
+
+            /* Get next call time from BSEC (it was updated during bme680_read) */
+            next_call_ms = bme680_get_next_call_ms();
+        } else {
+            /* Read failed - BSEC not ready yet, get updated next_call time */
+            ESP_LOGD(TAG, "BME680 read skipped (BSEC not ready)");
+            next_call_ms = bme680_get_next_call_ms();
+        }
+    }
+}
+#endif /* CONFIG_BME680_ENABLED */
 
 /* ======================== CAN Tasks ======================== */
 
@@ -129,7 +205,7 @@ static void twai_transmit_task(void *arg) {
                          incoming.sensor_id, incoming.data.veml.lux);
             }
 
-            /* Transmit VEML7700 data */
+            /* Transmit VEML7700 data (always present) */
             can_format_veml7700_message(&latest[SENSOR_VEML7700],
                                         sequence_counter,
                                         &tx_msg);
@@ -140,6 +216,34 @@ static void twai_transmit_task(void *arg) {
             if (twai_transmit(&tx_msg, pdMS_TO_TICKS(1000)) != ESP_OK) {
                 ESP_LOGW(TAG, "Failed to transmit VEML7700 message");
             }
+
+#ifdef CONFIG_BME680_ENABLED
+            /* Transmit BME680 environmental data (if available) */
+            if (latest[SENSOR_BME680].timestamp_ms > 0) {
+                can_format_bme_env_message(&latest[SENSOR_BME680], &tx_msg);
+
+                if (twai_transmit(&tx_msg, pdMS_TO_TICKS(1000)) != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to transmit BME680 environmental message");
+                } else {
+                    ESP_LOGD(TAG, "TX BME ENV: T=%.1f°C, H=%.1f%%, P=%.1fhPa",
+                             latest[SENSOR_BME680].data.bme.temperature,
+                             latest[SENSOR_BME680].data.bme.humidity,
+                             latest[SENSOR_BME680].data.bme.pressure);
+                }
+
+                /* Transmit BME680 air quality data */
+                can_format_bme_aiq_message(&latest[SENSOR_BME680], &tx_msg);
+
+                if (twai_transmit(&tx_msg, pdMS_TO_TICKS(1000)) != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to transmit BME680 air quality message");
+                } else {
+                    ESP_LOGD(TAG, "TX BME AIQ: IAQ=%d, CO2=%d ppm, VOC=%d ppm",
+                             latest[SENSOR_BME680].data.bme.iaq,
+                             latest[SENSOR_BME680].data.bme.co2_equiv,
+                             latest[SENSOR_BME680].data.bme.breath_voc);
+                }
+            }
+#endif /* CONFIG_BME680_ENABLED */
 
             sequence_counter++;
 
@@ -191,6 +295,18 @@ void app_main(void) {
     }
     ESP_LOGI(TAG, "Ambient light sensor (%s) initialized successfully", als_get_sensor_name());
 
+#ifdef CONFIG_BME680_ENABLED
+    /* Initialize BME680/BME688 environmental sensor */
+    if (bme680_init() == ESP_OK) {
+        ESP_LOGI(TAG, "BME680/688 (%s) initialized successfully (BSEC %s)",
+                 bme680_get_variant_name(), bme680_get_bsec_version());
+        ESP_LOGI(TAG, "BSEC calibration state age: %lu hours", bme680_get_state_age() / 3600);
+    } else {
+        ESP_LOGW(TAG, "BME680/688 not detected or initialization failed");
+        ESP_LOGW(TAG, "Continuing without BME680 support");
+    }
+#endif /* CONFIG_BME680_ENABLED */
+
     /* Configure and start TWAI (CAN) */
     twai_general_config_t g_config = {
         .mode = TWAI_MODE_NORMAL,
@@ -220,6 +336,12 @@ void app_main(void) {
 
     /* Create tasks */
     xTaskCreate(sensor_poll_task, "SENSOR_POLL", 3072, NULL, SENSOR_POLL_TASK_PRIO, NULL);
+
+#ifdef CONFIG_BME680_ENABLED
+    xTaskCreate(bme680_sensor_task, "BME680_POLL", 10240, NULL, BME680_TASK_PRIO, NULL);
+    ESP_LOGI(TAG, "BME680 sensor task created (10KB stack for BSEC)");
+#endif
+
     xTaskCreate(twai_receive_task, "TWAI_RX", 3072, NULL, CAN_RX_TASK_PRIO, NULL);
     xTaskCreate(twai_transmit_task, "TWAI_TX", 5120, NULL, CAN_TX_TASK_PRIO, NULL);
     xTaskCreate(twai_control_task, "TWAI_CTRL", 2048, NULL, CAN_CTRL_TSK_PRIO, NULL);

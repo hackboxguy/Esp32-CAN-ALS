@@ -22,11 +22,13 @@ if(EXISTS "${BSEC_LIB_PATH}" AND
     # Add source files
     set(COMPONENT_SRCS
         "src/bme68x.c"
+        "config/bsec_iaq.c"
     )
 
     # Add include directories
     set(COMPONENT_ADD_INCLUDEDIRS
         "include"
+        "config"
     )
 
     # Register component
