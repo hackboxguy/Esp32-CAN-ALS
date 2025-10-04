@@ -4,7 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Summary
 
-ESP32-C3/C6 automotive CAN node with ambient light sensor support. Production-ready implementation with runtime auto-detection supporting both **VEML7700** (0-120K lux, calibrated) and **OPT4001** (0-2.2M lux, factory calibrated) sensors. Features intelligent auto-ranging, moving average filtering, and modular queue-based architecture designed for multi-sensor expansion.
+ESP32-C3/C6 automotive CAN node with **multi-sensor support**: ambient light sensors (VEML7700/OPT4001) and environmental sensors (BME680/BME688). Production-ready implementation with runtime auto-detection, intelligent auto-ranging, and modular queue-based architecture designed for expansion.
+
+**Sensor Support:**
+- **Ambient Light:** VEML7700 (0-120K lux, calibrated) OR OPT4001 (0-2.2M lux, factory calibrated)
+- **Environmental:** BME680/BME688 with BSEC 2.x (temperature, humidity, pressure, air quality)
 
 ## Build and Development Commands
 
@@ -107,6 +111,15 @@ main/
 │   ├── Factory-calibrated (SOT-5x3 package)
 │   └── No filtering needed (stable readings)
 │
+├── bme680_bsec.c/h (~800 lines) - BME680/BME688 environmental sensor with BSEC
+│   ├── Runtime auto-detection (I2C address 0x76/0x77)
+│   ├── BSEC 2.6.1.0 library integration
+│   ├── **Simplified mode:** Direct T/H/P reading without BSEC subscription
+│   ├── Fixed 3-second reading interval
+│   ├── Heater disabled (T/H/P only, no gas/IAQ for now)
+│   ├── NVS state management (for future IAQ calibration)
+│   └── **Future:** IAQ/CO2/VOC support requires BSEC subscription setup
+│
 └── can_protocol.c/h (~160 lines) - CAN message formatting
     ├── Message ID definitions
     ├── can_format_veml7700_message()
@@ -118,20 +131,21 @@ main/
 ```
 ┌─────────────────┐
 │ sensor_poll_task│──┐
+│   (ALS, 1 Hz)   │  │
 │   (Priority 5)  │  │
 └─────────────────┘  │
                      │    ┌──────────────┐    ┌──────────────────┐
-                     ├───→│ sensor_queue │───→│ twai_transmit    │──→ CAN Bus
-                     │    │  (depth: 20) │    │    _task (P8)    │
-┌─────────────────┐  │    └──────────────┘    └──────────────────┘
-│ (future sensors)│──┘                                ▲
-└─────────────────┘                                   │
-                                                      │
-                                            ┌─────────┴────────┐
-                                            │ twai_receive_task│
-                                            │   (Priority 9)   │
-                                            │ START/STOP cmds  │
-                                            └──────────────────┘
+┌─────────────────┐  ├───→│ sensor_queue │───→│ twai_transmit    │──→ CAN Bus
+│ bme680_sensor   │  │    │  (depth: 20) │    │    _task (P8)    │
+│   _task (3s)    │──┘    └──────────────┘    └──────────────────┘
+│   (Priority 5)  │                                    ▲
+└─────────────────┘                                    │
+                                                       │
+                                             ┌─────────┴────────┐
+                                             │ twai_receive_task│
+                                             │   (Priority 9)   │
+                                             │ START/STOP cmds  │
+                                             └──────────────────┘
 ```
 
 **Queue-Based Design:**
@@ -208,6 +222,89 @@ The firmware supports two ambient light sensors with **runtime auto-detection**:
   - Config 0-20 = VEML7700
   - Config 100-111 = OPT4001
 
+### BME680/BME688 Environmental Sensor Support
+
+The firmware supports BME680/BME688 environmental sensors with **runtime auto-detection** and BSEC 2.6.1.0 library integration.
+
+**Current Implementation (Simplified Mode):**
+- **Temperature/Humidity/Pressure ONLY** - Direct sensor reading without BSEC virtual sensor subscription
+- **No IAQ/CO2/VOC** - Requires BSEC subscription which is currently disabled
+- **Fixed 3-second reading interval** - Simple periodic polling
+- **Heater disabled** - Gas resistance not measured (saves power, no IAQ anyway)
+- **Sensor configuration:** T_os=8x, H_os=2x, P_os=4x (high accuracy)
+
+**Why Simplified Mode?**
+
+The BSEC library has two modes of operation:
+1. **Virtual sensor subscription** (BSEC-driven) - For IAQ/CO2/VOC outputs with dynamic timing
+2. **Direct physical sensor reading** (Raw mode) - For basic T/H/P only
+
+We use simplified mode because:
+- The IAQ config blob (`bsec_config_iaq`) does NOT support requesting RAW outputs as virtual sensors
+- Virtual sensor subscription is complex and requires specific output combinations
+- For basic environmental monitoring, direct T/H/P reading is sufficient and more reliable
+
+**Key Technical Details:**
+
+**I2C Addresses:**
+- Primary: 0x77 (default for most breakout boards)
+- Alternate: 0x76 (configurable via SDO pin)
+- Auto-detection tries both addresses
+
+**Reading Flow** [bme680_bsec.c:492-719]:
+1. Configure sensor with fixed settings (no BSEC control)
+2. Trigger forced mode measurement
+3. Wait ~82ms for measurement completion
+4. Read raw T/H/P values from sensor
+5. Feed data to BSEC in background (for future calibration)
+6. Use raw sensor values directly (bypass BSEC outputs)
+
+**Data Accuracy:**
+- Temperature: ±1.0°C (typ), ±1.5°C (max)
+- Humidity: ±3% RH (typ)
+- Pressure: ±1.0 hPa (typ)
+
+**NVS State Management:**
+- Namespace: `bme68x_state`
+- Saves BSEC calibration state every 4 hours (future IAQ use)
+- Persists across reboots for faster IAQ convergence
+
+**Future IAQ/CO2/VOC Support:**
+
+To enable air quality outputs, the following changes are needed:
+
+1. **Enable heater:**
+   ```c
+   heatr_conf.enable = BME68X_ENABLE;
+   heatr_conf.heatr_temp = 320;  // °C (typical for IAQ)
+   heatr_conf.heatr_dur = 150;   // ms
+   ```
+
+2. **Setup BSEC subscription:**
+   ```c
+   bsec_sensor_configuration_t requested_virtual_sensors[] = {
+       {BSEC_OUTPUT_STATIC_IAQ, BSEC_SAMPLE_RATE_LP},
+       // Note: Must use outputs supported by loaded config blob
+       // Check BSEC_OUTPUT_INCLUDED bitfield (0x1279EF for current config)
+   };
+   ```
+
+3. **Use BSEC-driven timing:**
+   - Call `bsec_sensor_control()` before each measurement
+   - Apply BSEC-provided sensor settings (not fixed settings)
+   - Read at intervals specified by BSEC (typically 3s for LP mode)
+
+4. **Wait for calibration:**
+   - IAQ accuracy starts at 0 (uncalibrated)
+   - Takes ~5 minutes to reach accuracy 1
+   - Takes ~30 minutes to reach accuracy 3 (fully calibrated)
+   - Calibration persists in NVS across reboots
+
+**Known Issues:**
+- BSEC subscription currently fails with warning 10 (incompatible output combination)
+- Need to determine which virtual sensor outputs the loaded config actually supports
+- May need different BSEC config blob for IAQ support
+
 ### CAN Protocol
 
 **Message IDs:**
@@ -232,19 +329,24 @@ Byte 6-7: Checksum (sum of bytes 0-5, uint16_t LE)
 ```
 GPIO4:  CAN TX
 GPIO5:  CAN RX
-GPIO6:  I2C SDA (VEML7700 @ 0x10 OR OPT4001 @ 0x44)
-GPIO7:  I2C SCL (VEML7700 @ 0x10 OR OPT4001 @ 0x44)
+GPIO6:  I2C SDA (Shared bus for all I2C sensors)
+GPIO7:  I2C SCL (Shared bus for all I2C sensors)
 ```
 
-**Note:** Only one ambient light sensor should be connected at a time. The firmware automatically detects which sensor is present via I2C address probing.
+**I2C Bus Sharing:**
+- VEML7700 @ 0x10 OR OPT4001 @ 0x44 (Ambient light - only one should be connected)
+- BME680/BME688 @ 0x76 or 0x77 (Environmental sensor)
+- All sensors share the same I2C bus (I2C_NUM_0)
+- Pull-up resistors: 4.7kΩ recommended
 
 ### Resource Usage
 
-- **Flash:** ~220 KB (with OPT4001 + VEML7700 support)
-- **SRAM:** ~75 KB (out of 400 KB available)
-- **CPU Load:** <5% @ 160 MHz
+- **Flash:** ~295 KB (with OPT4001 + VEML7700 + BME680 + BSEC)
+- **SRAM:** ~90 KB (out of 400 KB available)
+- **CPU Load:** <10% @ 160 MHz (both sensors active)
 - **Task Stacks:**
-  - sensor_poll_task: 3 KB (increased for powf() in OPT4001 driver)
+  - sensor_poll_task: 3 KB (ALS sensor)
+  - bme680_sensor_task: 10 KB (BSEC library requires large stack)
   - twai_transmit_task: 5 KB
   - twai_receive_task: 3 KB
   - twai_control_task: 2 KB (self-deletes after start)
@@ -286,6 +388,55 @@ GPIO7:  I2C SCL (VEML7700 @ 0x10 OR OPT4001 @ 0x44)
 4. **Testing:** Verify against reference lux meter
    - Target accuracy: ±2% across range
    - Test at: dim indoor (~100 lux), bright indoor (~1000 lux), outdoor (~10K+ lux)
+
+### When Modifying BME680 Driver
+
+**Current Simplified Mode (T/H/P only):**
+
+1. **Sensor configuration is FIXED** - not driven by BSEC
+   - T_os=8x, H_os=2x, P_os=4x (high accuracy)
+   - Heater disabled (no gas measurement)
+   - Forced mode with fixed 3-second interval
+
+2. **Values come from raw sensor** - not BSEC outputs
+   - Direct reading from `bme68x_data` structure
+   - BSEC processing runs in background but outputs are not used
+   - This is intentional to avoid broken BSEC subscription
+
+3. **Testing:** Verify T/H/P accuracy
+   - Temperature should track room temperature (±1.5°C)
+   - Humidity should be reasonable (20-80% indoors)
+   - Pressure should match local barometric pressure (~980-1030 hPa)
+
+**Future IAQ Mode (when enabling air quality):**
+
+1. **BSEC subscription must be fixed first**
+   - Current issue: Warning 10 (incompatible output combination)
+   - Need to find which virtual sensors the config blob actually supports
+   - May need different BSEC config blob
+
+2. **Enable heater carefully**
+   - Temperature: 320°C typical for IAQ
+   - Duration: 150ms per measurement
+   - Increases power consumption significantly
+   - Adds self-heating offset to temperature reading
+
+3. **BSEC timing is CRITICAL**
+   - Must call `bsec_sensor_control()` before EVERY measurement
+   - Must apply BSEC-provided settings (not fixed settings)
+   - Must respect BSEC next_call timing (error 100 if called too early/late)
+
+4. **Calibration takes time**
+   - IAQ accuracy 0 = uncalibrated (first 5 minutes)
+   - IAQ accuracy 1 = low accuracy (5-30 minutes)
+   - IAQ accuracy 2 = medium accuracy (30+ minutes)
+   - IAQ accuracy 3 = high accuracy (hours of operation)
+   - State persists in NVS, so don't clear NVS during testing
+
+5. **Stack size is critical**
+   - BME680 task requires 10KB stack minimum
+   - BSEC library uses significant stack space
+   - Stack overflow will cause silent crashes
 
 ### When Modifying CAN Protocol
 

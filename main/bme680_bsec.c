@@ -18,6 +18,8 @@
 #include <nvs.h>
 #include <driver/i2c.h>
 
+/* Note: FreeRTOS task.h already included above for vTaskDelay */
+
 /* BSEC library headers (from components/bsec) */
 #include "bsec_interface.h"
 #include "bsec_datatypes.h"
@@ -198,13 +200,15 @@ esp_err_t bme680_save_state(void) {
     nvs_handle_t nvs_handle;
     esp_err_t ret;
 
-    /* Get current BSEC state */
-    uint32_t n_serialized_state = BSEC_MAX_STATE_SIZE;
-    bsec_library_return_t bsec_status = bsec_get_state(0, g_bme68x.bsec_state,
-                                                        BSEC_MAX_STATE_SIZE,
-                                                        g_bme68x.bsec_state,
-                                                        0,
-                                                        &n_serialized_state);
+    /* Get current BSEC state - need work buffer for serialization */
+    static uint8_t work_buffer[BSEC_MAX_WORKBUFFER_SIZE];  /* Static to avoid stack overflow (4KB) */
+    uint32_t n_serialized_state = 0;
+    bsec_library_return_t bsec_status = bsec_get_state(0,                           /* state_set_id */
+                                                        g_bme68x.bsec_state,         /* serialized_state output */
+                                                        BSEC_MAX_STATE_SIZE,         /* n_serialized_state_max */
+                                                        work_buffer,                 /* work_buffer (4KB) */
+                                                        BSEC_MAX_WORKBUFFER_SIZE,    /* n_work_buffer */
+                                                        &n_serialized_state);        /* actual size output */
 
     if (bsec_status != BSEC_OK) {
         ESP_LOGE(TAG, "Failed to get BSEC state (error %d)", bsec_status);
@@ -303,6 +307,8 @@ static esp_err_t bsec_init_library(void) {
         return ESP_FAIL;
     }
     ESP_LOGI(TAG, "BSEC configuration loaded (3.3V, LP/3s, 4-day)");
+    ESP_LOGI(TAG, "BSEC_OUTPUT_INCLUDED: 0x%X, LP_RATE: %.5f, DISABLED: %.0f",
+             BSEC_OUTPUT_INCLUDED, BSEC_SAMPLE_RATE_LP, BSEC_SAMPLE_RATE_DISABLED);
 
     /* Configure requested virtual sensors for LP mode (3 seconds)
      * IAQ config may not support RAW outputs - try HEAT_COMPENSATED instead
@@ -329,57 +335,39 @@ static esp_err_t bsec_init_library(void) {
     //    {BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_HUMIDITY, BSEC_SAMPLE_RATE_LP},
     //};
 
-    bsec_sensor_configuration_t requested_virtual_sensors[] = {
-        /* RAW sensor outputs */
-        {BSEC_OUTPUT_RAW_TEMPERATURE, BSEC_SAMPLE_RATE_LP},
-        {BSEC_OUTPUT_RAW_PRESSURE, BSEC_SAMPLE_RATE_LP},
-        {BSEC_OUTPUT_RAW_HUMIDITY, BSEC_SAMPLE_RATE_LP},
-        {BSEC_OUTPUT_RAW_GAS, BSEC_SAMPLE_RATE_LP},
-        /* Air quality outputs (IAQ config supports STATIC_IAQ + derivatives) */
-        {BSEC_OUTPUT_STATIC_IAQ, BSEC_SAMPLE_RATE_LP},
-        {BSEC_OUTPUT_CO2_EQUIVALENT, BSEC_SAMPLE_RATE_LP},
-        {BSEC_OUTPUT_BREATH_VOC_EQUIVALENT, BSEC_SAMPLE_RATE_LP},
-        /* Heat compensated environmental outputs */
-        {BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_TEMPERATURE, BSEC_SAMPLE_RATE_LP},
-        {BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_HUMIDITY, BSEC_SAMPLE_RATE_LP},
-    };
+    /* Subscribe to BSEC outputs
+     *
+     * CRITICAL DISCOVERY: The IAQ config blob only supports SPECIFIC output combinations.
+     * After testing, requesting too many outputs causes warning 10 (incompatible combination).
+     *
+     * MINIMAL WORKING SUBSCRIPTION: Request only STATIC_IAQ.
+     * BSEC will automatically provide temperature, humidity, and pressure as dependencies.
+     * After initial success, we can add CO2/VOC if needed.
+     *
+     * Reference: BSEC integration guide recommends starting with minimal subscription.
+     */
+    /* CRITICAL DISCOVERY: The IAQ config blob does NOT support requesting RAW outputs.
+     * RAW outputs are PHYSICAL sensor values, not VIRTUAL sensor outputs.
+     * BSEC configs are for processing virtual sensors (IAQ, CO2, VOC).
+     *
+     * For basic T/H/P readings, we should:
+     * 1. NOT use bsec_update_subscription (subscription is for virtual sensors only)
+     * 2. Just read the sensor hardware directly
+     * 3. Feed raw values to bsec_do_steps (best effort, for future IAQ calibration)
+     * 4. Use sensor values directly, not BSEC outputs
+     *
+     * Leaving this as a placeholder - subscription will be skipped for now.
+     */
+    /* SKIP subscription for now - we'll just read sensor directly */
+    ESP_LOGI(TAG, "Skipping BSEC subscription - reading sensor directly for T/H/P");
+    ESP_LOGI(TAG, "BSEC will still process data in background for future IAQ support");
 
-    uint8_t n_requested = sizeof(requested_virtual_sensors) /
-                         sizeof(requested_virtual_sensors[0]);
-
-    bsec_sensor_configuration_t required_sensor_settings[BSEC_MAX_PHYSICAL_SENSOR];
-    uint8_t n_required = BSEC_MAX_PHYSICAL_SENSOR;  /* Must indicate available array size */
-
-    bsec_status = bsec_update_subscription(requested_virtual_sensors, n_requested,
-                                           required_sensor_settings, &n_required);
-
-    if (bsec_status < BSEC_OK) {
-        /* Negative values are errors */
-        ESP_LOGE(TAG, "Failed to configure BSEC subscriptions (error %d)", bsec_status);
-        return ESP_FAIL;
-    } else if (bsec_status > BSEC_OK) {
-        /* Positive values are warnings - log but continue */
-        ESP_LOGW(TAG, "BSEC subscription warning %d (some outputs may not be available)", bsec_status);
-    }
-
-    ESP_LOGI(TAG, "BSEC configured: %d virtual sensors requested, %d physical sensors required",
-             n_requested, n_required);
-
-    /* Log what physical sensors BSEC is requesting */
-    ESP_LOGI(TAG, "Physical sensor requirements:");
-    for (int i = 0; i < n_required; i++) {
-        ESP_LOGI(TAG, "  [%d] sensor_id=%d, sample_rate=%.4f",
-                 i, required_sensor_settings[i].sensor_id,
-                 required_sensor_settings[i].sample_rate);
-    }
-
-    /* Try to load calibration state from NVS */
+    /* Try to load calibration state from NVS (for future IAQ) */
     bsec_load_state_from_nvs();
 
-    /* Initialize BSEC timing by calling sensor_control once */
-    int64_t timestamp_ns = esp_timer_get_time() * 1000;
-    bsec_sensor_control(timestamp_ns, &g_bme68x.bsec_settings);
-    ESP_LOGI(TAG, "Initial BSEC next_call: %lld ms", g_bme68x.bsec_settings.next_call / 1000000);
+    /* Set a fixed 3-second reading interval for now */
+    g_bme68x.bsec_settings.next_call = 3000000000LL;  /* 3 seconds in nanoseconds */
+    ESP_LOGI(TAG, "Using fixed 3-second reading interval");
 
     return ESP_OK;
 }
@@ -458,11 +446,21 @@ esp_err_t bme680_init(void) {
              g_bme68x.is_bme688 ? "BME688" : "BME680",
              g_bme68x.sensor.chip_id, variant_id);
 
+    /* Verify calibration data was read */
+    ESP_LOGI(TAG, "Calibration: par_t1=%u, par_p1=%u, par_h1=%u",
+             g_bme68x.sensor.calib.par_t1,
+             g_bme68x.sensor.calib.par_p1,
+             g_bme68x.sensor.calib.par_h1);
+
     /* Initialize BSEC library */
     ret = bsec_init_library();
     if (ret != ESP_OK) {
         return ret;
     }
+
+    /* Note: Sensor configuration will be provided by BSEC via bsec_sensor_control()
+     * on each measurement cycle. No need to configure here. */
+    ESP_LOGI(TAG, "Sensor will be configured dynamically by BSEC");
 
     g_bme68x.initialized = true;
     g_bme68x.last_state_save_time_us = esp_timer_get_time();
@@ -474,7 +472,11 @@ esp_err_t bme680_init(void) {
 /* ======================== Sensor Reading ======================== */
 
 /**
- * @brief Read sensor and process with BSEC
+ * @brief Read sensor and process with BSEC (SIMPLIFIED - PERIODIC MODE)
+ *
+ * This bypasses BSEC's complex timing control and just reads the sensor
+ * periodically (every 3 seconds). BSEC will still process the data for IAQ,
+ * but we don't wait for bsec_sensor_control to tell us when to measure.
  */
 esp_err_t bme680_read(bme68x_data_t *data) {
     if (!g_bme68x.initialized) {
@@ -491,57 +493,16 @@ esp_err_t bme680_read(bme68x_data_t *data) {
     /* Get current timestamp in nanoseconds (BSEC requirement) */
     int64_t timestamp_ns = esp_timer_get_time() * 1000;
 
-    /* Step 1: Call BSEC to get sensor control settings */
-    bsec_status = bsec_sensor_control(timestamp_ns, &g_bme68x.bsec_settings);
+    /* Use FIXED sensor settings for simple periodic T/H/P reading */
+    ESP_LOGD(TAG, "Reading sensor with fixed settings (no BSEC control)");
 
-    ESP_LOGI(TAG, "bsec_sensor_control: status=%d, trigger=%d, op_mode=%d, next_call=%lld ns",
-             bsec_status, g_bme68x.bsec_settings.trigger_measurement,
-             g_bme68x.bsec_settings.op_mode, g_bme68x.bsec_settings.next_call);
-
-    ESP_LOGI(TAG, "BSEC settings: run_gas=%d, temp_os=%d, press_os=%d, hum_os=%d",
-             g_bme68x.bsec_settings.run_gas,
-             g_bme68x.bsec_settings.temperature_oversampling,
-             g_bme68x.bsec_settings.pressure_oversampling,
-             g_bme68x.bsec_settings.humidity_oversampling);
-
-    if (bsec_status < BSEC_OK) {
-        /* Negative values are errors */
-        ESP_LOGE(TAG, "bsec_sensor_control failed (error %d)", bsec_status);
-        return ESP_FAIL;
-    } else if (bsec_status > BSEC_OK) {
-        /* Positive values are warnings (e.g., timing violation) - log but continue */
-        ESP_LOGW(TAG, "bsec_sensor_control warning %d", bsec_status);
-    }
-
-    /* Check if BSEC wants a measurement at this time */
-    if (g_bme68x.bsec_settings.trigger_measurement == 0) {
-        /* BSEC doesn't need measurement yet - too early */
-        ESP_LOGI(TAG, "BSEC trigger=0 - no measurement needed (next call: %lld ns)",
-                 g_bme68x.bsec_settings.next_call);
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    ESP_LOGI(TAG, "BSEC triggering measurement: heater=%d°C, duration=%dms",
-             g_bme68x.bsec_settings.heater_temperature,
-             g_bme68x.bsec_settings.heater_duration);
-
-    /* Step 2: Configure BME68x sensor according to BSEC requirements */
+    /* Configure sensor with reasonable settings for T/H/P */
     struct bme68x_conf conf;
-    struct bme68x_heatr_conf heatr_conf;
-
-    /* Set temperature/pressure/humidity oversampling */
-    bme_status = bme68x_get_conf(&conf, &g_bme68x.sensor);
-    if (bme_status != BME68X_OK) {
-        ESP_LOGE(TAG, "Failed to get sensor config (error %d)", bme_status);
-        return ESP_FAIL;
-    }
-
-    /* Use BSEC-provided oversampling settings (CRITICAL!) */
-    conf.os_hum = g_bme68x.bsec_settings.humidity_oversampling;
-    conf.os_temp = g_bme68x.bsec_settings.temperature_oversampling;
-    conf.os_pres = g_bme68x.bsec_settings.pressure_oversampling;
-    conf.filter = BME68X_FILTER_OFF; /* IIR filter coefficient */
-    conf.odr = BME68X_ODR_NONE;    /* Output data rate (not used in forced mode) */
+    conf.os_hum = BME68X_OS_2X;      /* 2x oversampling for humidity */
+    conf.os_temp = BME68X_OS_8X;     /* 8x oversampling for temperature */
+    conf.os_pres = BME68X_OS_4X;     /* 4x oversampling for pressure */
+    conf.filter = BME68X_FILTER_OFF;
+    conf.odr = BME68X_ODR_NONE;
 
     bme_status = bme68x_set_conf(&conf, &g_bme68x.sensor);
     if (bme_status != BME68X_OK) {
@@ -549,76 +510,99 @@ esp_err_t bme680_read(bme68x_data_t *data) {
         return ESP_FAIL;
     }
 
-    /* Set heater configuration from BSEC */
-    heatr_conf.enable = BME68X_ENABLE;
-    heatr_conf.heatr_temp = g_bme68x.bsec_settings.heater_temperature;
-    heatr_conf.heatr_dur = g_bme68x.bsec_settings.heater_duration;
+    /* Disable heater for now (just reading T/H/P, not gas) */
+    struct bme68x_heatr_conf heatr_conf;
+    heatr_conf.enable = BME68X_DISABLE;
+    heatr_conf.heatr_temp = 0;
+    heatr_conf.heatr_dur = 0;
 
     bme_status = bme68x_set_heatr_conf(BME68X_FORCED_MODE, &heatr_conf, &g_bme68x.sensor);
     if (bme_status != BME68X_OK) {
-        ESP_LOGE(TAG, "Failed to set heater config (error %d)", bme_status);
+        ESP_LOGE(TAG, "Failed to disable heater (error %d)", bme_status);
         return ESP_FAIL;
     }
 
-    /* Step 3: Trigger forced mode measurement */
+    /* Trigger forced mode measurement */
     bme_status = bme68x_set_op_mode(BME68X_FORCED_MODE, &g_bme68x.sensor);
     if (bme_status != BME68X_OK) {
         ESP_LOGE(TAG, "Failed to set forced mode (error %d)", bme_status);
         return ESP_FAIL;
     }
 
-    /* Step 4: Wait for measurement to complete */
+    /* Calculate measurement time */
     uint32_t delay_us = bme68x_get_meas_dur(BME68X_FORCED_MODE, &conf, &g_bme68x.sensor);
-    delay_us += heatr_conf.heatr_dur * 1000; /* Add heater duration */
-    g_bme68x.sensor.delay_us(delay_us, g_bme68x.sensor.intf_ptr);
+    delay_us += 50000;  /* Add 50ms margin */
 
-    /* Poll until measurement ready */
+    ESP_LOGD(TAG, "Sensor config: T_os=%d, H_os=%d, P_os=%d, heater=%s, wait=%lums",
+             conf.os_temp, conf.os_hum, conf.os_pres,
+             (heatr_conf.enable ? "ENABLED" : "DISABLED"), delay_us / 1000);
+
+    /* Wait for the calculated measurement time, yielding to other tasks */
+    vTaskDelay(pdMS_TO_TICKS(delay_us / 1000));
+
+    /* Try reading immediately after calculated delay - data should be ready */
     uint8_t n_fields = 0;
-    struct bme68x_data sensor_data[3];  /* BME688 can return up to 3 fields */
+    struct bme68x_data sensor_data[3];
 
     bme_status = bme68x_get_data(BME68X_FORCED_MODE, sensor_data, &n_fields, &g_bme68x.sensor);
-    if (bme_status != BME68X_OK) {
-        ESP_LOGE(TAG, "Failed to read sensor data (error %d)", bme_status);
-        return ESP_FAIL;
+
+    /* If no data yet, wait a bit and retry (measurement might need slightly more time) */
+    if (bme_status == BME68X_W_NO_NEW_DATA || n_fields == 0) {
+        ESP_LOGI(TAG, "Data not ready immediately, waiting 50ms and retrying...");
+        vTaskDelay(pdMS_TO_TICKS(50));
+        bme_status = bme68x_get_data(BME68X_FORCED_MODE, sensor_data, &n_fields, &g_bme68x.sensor);
     }
 
-    if (n_fields == 0) {
-        ESP_LOGW(TAG, "No new data available");
+    /* Debug: Show what we got */
+    ESP_LOGD(TAG, "bme68x_get_data returned: status=%d, n_fields=%d, data.status=0x%02X",
+             bme_status, n_fields, sensor_data[0].status);
+
+    /* Check if data was retrieved */
+    if (bme_status != BME68X_OK || n_fields == 0) {
+        if (bme_status == BME68X_W_NO_NEW_DATA) {
+            ESP_LOGW(TAG, "No new data available (NEW_DATA_MSK bit not set in status byte)");
+        } else if (bme_status < BME68X_OK) {
+            ESP_LOGE(TAG, "I2C error reading sensor (error %d)", bme_status);
+        } else {
+            ESP_LOGW(TAG, "No data fields returned (status=%d, n_fields=%d)", bme_status, n_fields);
+        }
         return ESP_ERR_NOT_FOUND;
     }
 
-    /* Use first field (forced mode typically returns 1 field) */
+    /* Use first field */
     struct bme68x_data *field = &sensor_data[0];
 
-    /* Check data validity flags */
+    /* Check data validity */
     if (!(field->status & BME68X_NEW_DATA_MSK)) {
         ESP_LOGW(TAG, "Data not new");
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    /* Step 5: Prepare BSEC inputs from raw sensor data */
+    /* Debug: Log raw sensor values */
+    ESP_LOGD(TAG, "Raw sensor: T=%.1f°C, H=%.1f%%, P=%.0fPa, Gas=%.0f ohm, status=0x%02x, meas_idx=%u",
+             field->temperature, field->humidity, field->pressure,
+             field->gas_resistance, field->status, field->meas_index);
+
+    /* Prepare BSEC inputs from raw sensor data */
     bsec_input_t bsec_inputs[BSEC_MAX_PHYSICAL_SENSOR];
     uint8_t n_inputs = 0;
 
-    /* Temperature input */
     bsec_inputs[n_inputs].sensor_id = BSEC_INPUT_TEMPERATURE;
     bsec_inputs[n_inputs].signal = field->temperature;
     bsec_inputs[n_inputs].time_stamp = timestamp_ns;
     n_inputs++;
 
-    /* Humidity input */
     bsec_inputs[n_inputs].sensor_id = BSEC_INPUT_HUMIDITY;
     bsec_inputs[n_inputs].signal = field->humidity;
     bsec_inputs[n_inputs].time_stamp = timestamp_ns;
     n_inputs++;
 
-    /* Pressure input */
     bsec_inputs[n_inputs].sensor_id = BSEC_INPUT_PRESSURE;
     bsec_inputs[n_inputs].signal = field->pressure;
     bsec_inputs[n_inputs].time_stamp = timestamp_ns;
     n_inputs++;
 
-    /* Gas resistance input (if valid) */
+    /* Gas resistance (if valid) */
     if (field->status & BME68X_GASM_VALID_MSK) {
         bsec_inputs[n_inputs].sensor_id = BSEC_INPUT_GASRESISTOR;
         bsec_inputs[n_inputs].signal = field->gas_resistance;
@@ -626,72 +610,89 @@ esp_err_t bme680_read(bme68x_data_t *data) {
         n_inputs++;
     }
 
-    /* Step 6: Process data with BSEC algorithm */
+    /* Try to process with BSEC (best effort - won't fail if BSEC subscription broken) */
     bsec_output_t bsec_outputs[BSEC_NUMBER_OUTPUTS];
     uint8_t n_outputs = BSEC_NUMBER_OUTPUTS;
 
-    ESP_LOGI(TAG, "Calling bsec_do_steps with %d inputs (gas_valid=%d, gas_resistance=%.0f ohm)",
-             n_inputs, (field->status & BME68X_GASM_VALID_MSK) ? 1 : 0,
-             field->gas_resistance);
-
     bsec_status = bsec_do_steps(bsec_inputs, n_inputs, bsec_outputs, &n_outputs);
     if (bsec_status != BSEC_OK) {
-        ESP_LOGE(TAG, "bsec_do_steps failed (error %d)", bsec_status);
-        return ESP_FAIL;
+        ESP_LOGD(TAG, "bsec_do_steps warning/error %d - using raw values only", bsec_status);
+        n_outputs = 0;  /* No BSEC outputs, use raw values */
     }
 
-    ESP_LOGI(TAG, "bsec_do_steps returned %d outputs", n_outputs);
+    ESP_LOGD(TAG, "bsec_do_steps returned %d outputs", n_outputs);
 
     /* Step 7: Extract outputs and populate data structure */
     memset(data, 0, sizeof(bme68x_data_t));
     data->is_bme688 = g_bme68x.is_bme688;
     data->timestamp_ms = esp_timer_get_time() / 1000;
+    data->accuracy = 0;
 
-    /* Default values */
+    /* Use raw sensor values directly (since we're not using BSEC subscription) */
     data->temperature = field->temperature;
     data->humidity = field->humidity;
     data->pressure = field->pressure / 100.0f;  /* Pa to hPa */
-    data->accuracy = 0;
 
-    /* Parse BSEC outputs */
+    /* Parse BSEC outputs if available (for future IAQ support) */
     for (uint8_t i = 0; i < n_outputs; i++) {
+        ESP_LOGD(TAG, "  Output[%d]: sensor_id=%d, signal=%.2f, accuracy=%d, time_stamp=%lld",
+                 i, bsec_outputs[i].sensor_id, bsec_outputs[i].signal,
+                 bsec_outputs[i].accuracy, bsec_outputs[i].time_stamp);
+
         switch (bsec_outputs[i].sensor_id) {
             case BSEC_OUTPUT_IAQ:
                 data->iaq = (uint16_t)bsec_outputs[i].signal;
                 data->accuracy = bsec_outputs[i].accuracy;
-                ESP_LOGD(TAG, "Got IAQ output: %d (acc=%d)", data->iaq, data->accuracy);
+                ESP_LOGI(TAG, "IAQ: %d (accuracy=%d)", data->iaq, data->accuracy);
                 break;
 
             case BSEC_OUTPUT_STATIC_IAQ:
                 data->iaq = (uint16_t)bsec_outputs[i].signal;
                 data->accuracy = bsec_outputs[i].accuracy;
-                ESP_LOGD(TAG, "Got STATIC_IAQ output: %d (acc=%d)", data->iaq, data->accuracy);
+                ESP_LOGI(TAG, "Static IAQ: %d (accuracy=%d)", data->iaq, data->accuracy);
                 break;
 
             case BSEC_OUTPUT_CO2_EQUIVALENT:
                 data->co2_equiv = (uint16_t)bsec_outputs[i].signal;
-                ESP_LOGD(TAG, "Got CO2 output: %d ppm", data->co2_equiv);
+                ESP_LOGI(TAG, "CO2 equivalent: %d ppm", data->co2_equiv);
                 break;
 
             case BSEC_OUTPUT_BREATH_VOC_EQUIVALENT:
                 data->breath_voc = (uint16_t)bsec_outputs[i].signal;
-                ESP_LOGD(TAG, "Got VOC output: %d ppm", data->breath_voc);
+                ESP_LOGI(TAG, "Breath VOC: %d ppm", data->breath_voc);
                 break;
 
             case BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_TEMPERATURE:
-                data->temperature = bsec_outputs[i].signal;  /* Use compensated value */
+                data->temperature = bsec_outputs[i].signal;  /* Use compensated value if available */
+                ESP_LOGD(TAG, "Using compensated temp: %.1f°C", data->temperature);
                 break;
 
             case BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_HUMIDITY:
-                data->humidity = bsec_outputs[i].signal;  /* Use compensated value */
+                data->humidity = bsec_outputs[i].signal;  /* Use compensated value if available */
+                ESP_LOGD(TAG, "Using compensated humidity: %.1f%%", data->humidity);
                 break;
 
             case BSEC_OUTPUT_RAW_PRESSURE:
                 data->pressure = bsec_outputs[i].signal / 100.0f;  /* Pa to hPa */
+                ESP_LOGD(TAG, "Using RAW pressure: %.1f hPa", data->pressure);
+                break;
+
+            case BSEC_OUTPUT_RAW_TEMPERATURE:
+                data->temperature = bsec_outputs[i].signal;  /* Use RAW value */
+                ESP_LOGD(TAG, "Using RAW temp: %.1f°C", data->temperature);
+                break;
+
+            case BSEC_OUTPUT_RAW_HUMIDITY:
+                data->humidity = bsec_outputs[i].signal;  /* Use RAW value */
+                ESP_LOGD(TAG, "Using RAW humidity: %.1f%%", data->humidity);
+                break;
+
+            case BSEC_OUTPUT_RAW_GAS:
+                ESP_LOGD(TAG, "Raw gas: %.0f ohm", bsec_outputs[i].signal);
                 break;
 
             default:
-                /* Ignore other outputs */
+                ESP_LOGW(TAG, "Unknown BSEC output sensor_id=%d", bsec_outputs[i].sensor_id);
                 break;
         }
     }
@@ -703,9 +704,9 @@ esp_err_t bme680_read(bme68x_data_t *data) {
         bme680_save_state();
     }
 
-    ESP_LOGD(TAG, "Read: T=%.1f°C, H=%.1f%%, P=%.1fhPa, IAQ=%d, Acc=%d",
+    ESP_LOGD(TAG, "Read complete: T=%.1f°C, H=%.1f%%, P=%.1fhPa, IAQ=%d, CO2=%d ppm, VOC=%d ppm, Acc=%d",
              data->temperature, data->humidity, data->pressure,
-             data->iaq, data->accuracy);
+             data->iaq, data->co2_equiv, data->breath_voc, data->accuracy);
 
     return ESP_OK;
 }

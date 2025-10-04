@@ -94,30 +94,15 @@ static void bme680_sensor_task(void *arg) {
     sensor_data_t msg;
     bme68x_data_t bme_data;
 
-    ESP_LOGI(TAG, "BME680 sensor task started (BSEC-driven timing)");
-
-    /* Get initial next_call time from BSEC */
-    uint64_t next_call_ms = bme680_get_next_call_ms();
-    ESP_LOGI(TAG, "First BSEC call scheduled at %llu ms", next_call_ms);
+    ESP_LOGI(TAG, "BME680 sensor task started (fixed 3-second interval)");
 
     while (1) {
-        /* Wait until BSEC's next_call time (with 50ms buffer to ensure we're not early) */
-        uint64_t now_ms = esp_timer_get_time() / 1000;
-        uint64_t target_ms = next_call_ms + 50;  /* Add 50ms buffer */
-
-        if (target_ms > now_ms) {
-            uint32_t delay_ms = (uint32_t)(target_ms - now_ms);
-            ESP_LOGI(TAG, "Waiting %lu ms until BSEC call (next_call=%llu ms)", delay_ms, next_call_ms);
-            vTaskDelay(pdMS_TO_TICKS(delay_ms));
-        }
-
-        ESP_LOGI(TAG, "Attempting BME680 read at %llu ms", esp_timer_get_time() / 1000);
-
-        /* Read BME680 sensor */
+        /* Read BME680 sensor at fixed 3-second intervals */
         msg.sensor_id = SENSOR_BME680;
         msg.timestamp_ms = esp_timer_get_time() / 1000;
 
-        if (bme680_read(&bme_data) == ESP_OK) {
+        esp_err_t read_result = bme680_read(&bme_data);
+        if (read_result == ESP_OK) {
             msg.status = SENSOR_STATUS_OK;
 
             /* Copy data from BME68x structure to sensor_data_t */
@@ -129,21 +114,19 @@ static void bme680_sensor_task(void *arg) {
             msg.data.bme.co2_equiv = bme_data.co2_equiv;
             msg.data.bme.breath_voc = bme_data.breath_voc;
 
-            ESP_LOGI(TAG, "BME680: T=%.1f°C, H=%.1f%%, P=%.1fhPa, IAQ=%d (acc=%d), CO2=%dppm, VOC=%dppm",
-                     bme_data.temperature, bme_data.humidity, bme_data.pressure,
-                     bme_data.iaq, bme_data.accuracy, bme_data.co2_equiv, bme_data.breath_voc);
+            ESP_LOGI(TAG, "BME680: T=%.1f°C, H=%.1f%%, P=%.1fhPa",
+                     bme_data.temperature, bme_data.humidity, bme_data.pressure);
 
             /* Send to queue */
             if (xQueueSend(sensor_queue, &msg, 0) != pdTRUE) {
                 ESP_LOGW(TAG, "Sensor queue full, dropping BME680 reading");
             }
 
-            /* Get next call time from BSEC (it was updated during bme680_read) */
-            next_call_ms = bme680_get_next_call_ms();
+            /* Fixed 3-second interval */
+            vTaskDelay(pdMS_TO_TICKS(3000));
         } else {
-            /* Read failed - BSEC not ready yet, get updated next_call time */
-            ESP_LOGD(TAG, "BME680 read skipped (BSEC not ready)");
-            next_call_ms = bme680_get_next_call_ms();
+            ESP_LOGW(TAG, "BME680 read failed");
+            vTaskDelay(pdMS_TO_TICKS(1000));  /* Wait 1 sec on error, retry */
         }
     }
 }
