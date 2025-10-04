@@ -94,10 +94,21 @@ static void bme680_sensor_task(void *arg) {
     sensor_data_t msg;
     bme68x_data_t bme_data;
 
-    ESP_LOGI(TAG, "BME680 sensor task started (fixed 3-second interval)");
+    ESP_LOGI(TAG, "BME680 sensor task started (BSEC-driven timing)");
+
+    /* Wait for initial BSEC next_call time (set during init) */
+    uint64_t next_call_ms = bme680_get_next_call_ms();
+    if (next_call_ms > 0) {
+        uint64_t now_ms = esp_timer_get_time() / 1000;
+        if (next_call_ms > now_ms) {
+            uint64_t wait_ms = next_call_ms - now_ms;
+            ESP_LOGI(TAG, "Waiting %llu ms until first BSEC measurement", wait_ms);
+            vTaskDelay(pdMS_TO_TICKS(wait_ms));
+        }
+    }
 
     while (1) {
-        /* Read BME680 sensor at fixed 3-second intervals */
+        /* Read BME680 sensor at BSEC-requested intervals */
         msg.sensor_id = SENSOR_BME680;
         msg.timestamp_ms = esp_timer_get_time() / 1000;
 
@@ -114,19 +125,32 @@ static void bme680_sensor_task(void *arg) {
             msg.data.bme.co2_equiv = bme_data.co2_equiv;
             msg.data.bme.breath_voc = bme_data.breath_voc;
 
-            ESP_LOGI(TAG, "BME680: T=%.1f°C, H=%.1f%%, P=%.1fhPa",
-                     bme_data.temperature, bme_data.humidity, bme_data.pressure);
+            ESP_LOGI(TAG, "BME680: T=%.1f°C, H=%.1f%%, P=%.1fhPa, IAQ=%d (acc=%d), CO2=%dppm",
+                     bme_data.temperature, bme_data.humidity, bme_data.pressure,
+                     bme_data.iaq, bme_data.accuracy, bme_data.co2_equiv);
 
             /* Send to queue */
             if (xQueueSend(sensor_queue, &msg, 0) != pdTRUE) {
                 ESP_LOGW(TAG, "Sensor queue full, dropping BME680 reading");
             }
 
-            /* Fixed 3-second interval */
-            vTaskDelay(pdMS_TO_TICKS(3000));
+            /* Get next measurement time from BSEC */
+            next_call_ms = bme680_get_next_call_ms();
+            uint64_t now_ms = esp_timer_get_time() / 1000;
+            if (next_call_ms > now_ms) {
+                uint64_t wait_ms = next_call_ms - now_ms;
+                ESP_LOGD(TAG, "Next BSEC call in %llu ms", wait_ms);
+                vTaskDelay(pdMS_TO_TICKS(wait_ms));
+            } else {
+                /* Should not happen, but prevent tight loop */
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+        } else if (read_result == ESP_ERR_INVALID_STATE) {
+            /* Too early - wait a bit and retry */
+            vTaskDelay(pdMS_TO_TICKS(100));
         } else {
             ESP_LOGW(TAG, "BME680 read failed");
-            vTaskDelay(pdMS_TO_TICKS(1000));  /* Wait 1 sec on error, retry */
+            vTaskDelay(pdMS_TO_TICKS(1000));  /* Wait 1 sec on error */
         }
     }
 }
