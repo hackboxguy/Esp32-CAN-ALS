@@ -591,13 +591,22 @@ esp_err_t bme680_read(bme68x_data_t *data) {
         return ESP_FAIL;
     }
 
-    /* TEMPORARY DEBUG: Force disable gas sensor to test if TPH-only works */
+    /* Configure heater for gas sensor measurement */
     struct bme68x_heatr_conf heatr_conf;
-    heatr_conf.enable = BME68X_DISABLE;  /* Force disable for testing */
-    heatr_conf.heatr_temp = 0;
-    heatr_conf.heatr_dur = 0;
 
-    ESP_LOGW(TAG, "DEBUG: Gas sensor DISABLED for testing (heater off)");
+    /* Configure heater as requested by BSEC */
+    if (sensor_settings.run_gas) {
+        heatr_conf.enable = BME68X_ENABLE;
+        heatr_conf.heatr_temp = sensor_settings.heater_temperature;
+        heatr_conf.heatr_dur = sensor_settings.heater_duration;
+        ESP_LOGD(TAG, "Gas sensor enabled: heater=%u°C, duration=%ums",
+                 heatr_conf.heatr_temp, heatr_conf.heatr_dur);
+    } else {
+        heatr_conf.enable = BME68X_DISABLE;
+        heatr_conf.heatr_temp = 0;
+        heatr_conf.heatr_dur = 0;
+        ESP_LOGD(TAG, "Gas sensor disabled (BSEC did not request)");
+    }
 
     bme_status = bme68x_set_heatr_conf(BME68X_FORCED_MODE, &heatr_conf, &g_bme68x.sensor);
     if (bme_status != BME68X_OK) {
@@ -612,17 +621,15 @@ esp_err_t bme680_read(bme68x_data_t *data) {
         return ESP_FAIL;
     }
 
-    /* Verify the sensor entered forced mode */
-    uint8_t op_mode;
-    bme_status = bme68x_get_op_mode(&op_mode, &g_bme68x.sensor);
-    ESP_LOGI(TAG, "After trigger: op_mode=%d (0=sleep, 1=forced, 2=parallel)", op_mode);
-
     /* Calculate measurement time using BSEC settings */
     uint32_t delay_us = bme68x_get_meas_dur(BME68X_FORCED_MODE, &conf, &g_bme68x.sensor);
-    uint32_t total_delay_ms = (delay_us / 1000) + 100;  /* TPH only (no heater) + 100ms margin */
+    uint32_t tph_ms = delay_us / 1000;
+    uint32_t heater_ms = heatr_conf.enable ? heatr_conf.heatr_dur : 0;
+    uint32_t margin_ms = 100;
+    uint32_t total_delay_ms = tph_ms + heater_ms + margin_ms;
 
-    ESP_LOGI(TAG, "Measurement time: TPH=%lu ms, heater=DISABLED, margin=100ms, total=%lu ms",
-             delay_us / 1000, total_delay_ms);
+    ESP_LOGD(TAG, "Measurement time: TPH=%lu ms, heater=%lu ms, total=%lu ms",
+             tph_ms, heater_ms, total_delay_ms);
 
     /* Wait for measurement to complete with polling */
     uint8_t n_fields = 0;
@@ -631,7 +638,7 @@ esp_err_t bme680_read(bme68x_data_t *data) {
     uint32_t wait_step_ms = 100;  /* Poll every 100ms */
     uint32_t max_wait_ms = total_delay_ms + 2000;  /* Allow extra 2 seconds */
 
-    vTaskDelay(pdMS_TO_TICKS(total_delay_ms));  /* Initial wait */
+    vTaskDelay(pdMS_TO_TICKS(total_delay_ms));  /* Wait for measurement */
 
     /* Poll for data with timeout */
     for (uint32_t elapsed_ms = total_delay_ms; elapsed_ms < max_wait_ms; elapsed_ms += wait_step_ms) {
@@ -639,7 +646,7 @@ esp_err_t bme680_read(bme68x_data_t *data) {
         poll_count++;
 
         if (bme_status == BME68X_OK && n_fields > 0) {
-            ESP_LOGI(TAG, "Data ready after %lu ms (%u polls)", elapsed_ms, poll_count);
+            ESP_LOGD(TAG, "Data ready after %lu ms (%u polls)", elapsed_ms, poll_count);
             break;
         }
 
@@ -650,10 +657,6 @@ esp_err_t bme680_read(bme68x_data_t *data) {
 
         vTaskDelay(pdMS_TO_TICKS(wait_step_ms));
     }
-
-    /* Debug: Show what we got */
-    ESP_LOGI(TAG, "bme68x_get_data returned: status=%d, n_fields=%d, data.status=0x%02X",
-             bme_status, n_fields, n_fields > 0 ? sensor_data[0].status : 0);
 
     /* Check if data was retrieved */
     if (bme_status != BME68X_OK || n_fields == 0) {
@@ -787,6 +790,16 @@ esp_err_t bme680_read(bme68x_data_t *data) {
 
             case BSEC_OUTPUT_RAW_GAS:
                 ESP_LOGD(TAG, "Raw gas: %.0f ohm", bsec_outputs[i].signal);
+                break;
+
+            case BSEC_OUTPUT_STABILIZATION_STATUS:
+                ESP_LOGD(TAG, "Gas sensor stabilization: %s",
+                         (int)bsec_outputs[i].signal ? "finished" : "ongoing");
+                break;
+
+            case BSEC_OUTPUT_RUN_IN_STATUS:
+                ESP_LOGD(TAG, "Gas sensor run-in: %s",
+                         (int)bsec_outputs[i].signal ? "finished" : "ongoing");
                 break;
 
             default:

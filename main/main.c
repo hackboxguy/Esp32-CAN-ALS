@@ -8,6 +8,8 @@
 #include <freertos/queue.h>
 #include <esp_log.h>
 #include <esp_timer.h>
+#include <esp_system.h>
+#include <nvs_flash.h>
 #include <driver/twai.h>
 
 #include "sensor_common.h"
@@ -173,6 +175,42 @@ static void twai_receive_task(void *arg) {
                 ESP_LOGI(TAG, "Received START command");
                 xSemaphoreTake(start_sem, 0);  /* Clear if set */
                 xSemaphoreGive(start_sem);      /* Signal start */
+            } else if (rx_msg.identifier == ID_MASTER_SHUTDOWN_CMD) {
+                /* Graceful shutdown: Save state, stop transmission, keep running */
+                ESP_LOGI(TAG, "Received SHUTDOWN command - saving BSEC state...");
+#ifdef CONFIG_BME680_ENABLED
+                if (bme680_save_state() == ESP_OK) {
+                    ESP_LOGI(TAG, "BSEC calibration state saved successfully");
+                } else {
+                    ESP_LOGW(TAG, "Failed to save BSEC state");
+                }
+#endif
+                ESP_LOGI(TAG, "Ready for power-off (ESP32 still running)");
+                xSemaphoreTake(done_sem, 0);
+                xSemaphoreGive(done_sem);  /* Stop transmission */
+
+            } else if (rx_msg.identifier == ID_MASTER_REBOOT_CMD) {
+                /* Save state and reboot */
+                ESP_LOGI(TAG, "Received REBOOT command - saving state and rebooting...");
+#ifdef CONFIG_BME680_ENABLED
+                bme680_save_state();  /* Save current calibration */
+#endif
+                vTaskDelay(pdMS_TO_TICKS(500));  /* Allow logs to flush */
+                esp_restart();  /* Reboot ESP32 */
+
+            } else if (rx_msg.identifier == ID_MASTER_FACTORY_RST) {
+                /* Factory reset: Clear calibration and reboot */
+                ESP_LOGI(TAG, "Received FACTORY RESET command - clearing calibration...");
+#ifdef CONFIG_BME680_ENABLED
+                if (bme680_reset_calibration() == ESP_OK) {
+                    ESP_LOGI(TAG, "BSEC calibration cleared (factory default)");
+                } else {
+                    ESP_LOGW(TAG, "Failed to clear calibration");
+                }
+#endif
+                ESP_LOGI(TAG, "Rebooting to apply factory reset...");
+                vTaskDelay(pdMS_TO_TICKS(500));  /* Allow logs to flush */
+                esp_restart();  /* Reboot ESP32 */
             }
         }
     }
@@ -277,6 +315,16 @@ static void twai_control_task(void *arg) {
 
 void app_main(void) {
     ESP_LOGI(TAG, "ESP32 Multi-Sensor CAN Node starting...");
+
+    /* Initialize NVS flash (required for BME680 calibration storage) */
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS partition needs erase, erasing...");
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+    ESP_LOGI(TAG, "NVS flash initialized");
 
     /* Create semaphores */
     done_sem = xSemaphoreCreateBinary();

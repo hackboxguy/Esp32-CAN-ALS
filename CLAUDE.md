@@ -56,9 +56,12 @@ sudo ip link set can0 up
 # Monitor messages
 candump can0 -L
 
-# Send commands
-cansend can0 0A0#        # Stop transmission
+# Control commands
 cansend can0 0A1#        # Start transmission
+cansend can0 0A0#        # Stop transmission
+cansend can0 0A8#        # Graceful shutdown (save state)
+cansend can0 0A9#        # Reboot ESP32 (save state first)
+cansend can0 0AA#        # Factory reset (clear calibration)
 ```
 
 ### Testing
@@ -71,7 +74,23 @@ idf.py monitor
 candump can0 -t z
 
 # Test basic functionality
-cansend can0 0A1#        # Should see 0x0A2 messages at 1 Hz
+cansend can0 0A1#        # Start transmission
+# Should see:
+#   0x0A2 @ 1 Hz (ambient light - VEML7700 or OPT4001)
+#   0x0A3 @ 0.33 Hz (BME680 environmental - T/H/P)
+#   0x0A4 @ 0.33 Hz (BME680 air quality - IAQ/CO2/VOC)
+
+# Test graceful shutdown
+cansend can0 0A8#        # Shutdown (saves BSEC state)
+# Wait for "BSEC state saved to NVS" message
+
+# Test reboot with state persistence
+cansend can0 0A9#        # Reboot (saves and reboots)
+# Watch for IAQ accuracy to persist after reboot
+
+# Test factory reset
+cansend can0 0AA#        # Factory reset
+# IAQ accuracy should return to 0 after reboot
 ```
 
 ## Code Architecture
@@ -113,12 +132,12 @@ main/
 │
 ├── bme680_bsec.c/h (~800 lines) - BME680/BME688 environmental sensor with BSEC
 │   ├── Runtime auto-detection (I2C address 0x76/0x77)
-│   ├── BSEC 2.6.1.0 library integration
-│   ├── **Simplified mode:** Direct T/H/P reading without BSEC subscription
-│   ├── Fixed 3-second reading interval
-│   ├── Heater disabled (T/H/P only, no gas/IAQ for now)
-│   ├── NVS state management (for future IAQ calibration)
-│   └── **Future:** IAQ/CO2/VOC support requires BSEC subscription setup
+│   ├── BSEC 2.6.1.0 library integration (IAQ/CO2/VOC enabled)
+│   ├── Virtual sensor subscription with 8 BSEC outputs
+│   ├── Fixed 3-second reading interval (LP mode)
+│   ├── Gas heater enabled (380°C, 1000ms for IAQ measurement)
+│   ├── NVS state management (auto-saves every 4 hours)
+│   └── Calibration persistence across reboots
 │
 └── can_protocol.c/h (~160 lines) - CAN message formatting
     ├── Message ID definitions
@@ -224,25 +243,22 @@ The firmware supports two ambient light sensors with **runtime auto-detection**:
 
 ### BME680/BME688 Environmental Sensor Support
 
-The firmware supports BME680/BME688 environmental sensors with **runtime auto-detection** and BSEC 2.6.1.0 library integration.
+The firmware supports BME680/BME688 environmental sensors with **runtime auto-detection** and **full BSEC 2.6.1.0 integration** for air quality monitoring.
 
-**Current Implementation (Simplified Mode):**
-- **Temperature/Humidity/Pressure ONLY** - Direct sensor reading without BSEC virtual sensor subscription
-- **No IAQ/CO2/VOC** - Requires BSEC subscription which is currently disabled
-- **Fixed 3-second reading interval** - Simple periodic polling
-- **Heater disabled** - Gas resistance not measured (saves power, no IAQ anyway)
-- **Sensor configuration:** T_os=8x, H_os=2x, P_os=4x (high accuracy)
+**Current Implementation (Full IAQ Mode):**
+- ✅ **BSEC Virtual Sensor Subscription** - 8 outputs configured
+- ✅ **IAQ (Indoor Air Quality)** - Index 0-500 with accuracy tracking (0-3)
+- ✅ **CO2 Equivalent** - Estimated CO2 in ppm
+- ✅ **Breath VOC Equivalent** - Volatile organic compounds in ppm
+- ✅ **Temperature/Humidity/Pressure** - Heat-compensated and raw values
+- ✅ **Gas Heater** - 380°C for 1000ms (BSEC-controlled)
+- ✅ **Calibration Persistence** - NVS storage with 4-hour auto-save
+- ✅ **Graceful Shutdown** - CAN commands to save state before power-off
 
-**Why Simplified Mode?**
-
-The BSEC library has two modes of operation:
-1. **Virtual sensor subscription** (BSEC-driven) - For IAQ/CO2/VOC outputs with dynamic timing
-2. **Direct physical sensor reading** (Raw mode) - For basic T/H/P only
-
-We use simplified mode because:
-- The IAQ config blob (`bsec_config_iaq`) does NOT support requesting RAW outputs as virtual sensors
-- Virtual sensor subscription is complex and requires specific output combinations
-- For basic environmental monitoring, direct T/H/P reading is sufficient and more reliable
+**BSEC Configuration:**
+- Config blob: `bme680_iaq_33v_3s_4d` (3.3V, LP mode/3s, 4-day calibration)
+- Sample rate: BSEC_SAMPLE_RATE_LP (3-second intervals)
+- 8 virtual sensors subscribed (see bme680_bsec.c:370-382)
 
 **Key Technical Details:**
 
@@ -252,76 +268,112 @@ We use simplified mode because:
 - Auto-detection tries both addresses
 
 **Reading Flow** [bme680_bsec.c:492-719]:
-1. Configure sensor with fixed settings (no BSEC control)
-2. Trigger forced mode measurement
-3. Wait ~82ms for measurement completion
-4. Read raw T/H/P values from sensor
-5. Feed data to BSEC in background (for future calibration)
-6. Use raw sensor values directly (bypass BSEC outputs)
+1. Call `bsec_sensor_control()` to get BSEC-requested settings
+2. Apply sensor configuration (T/H/P oversampling, heater profile)
+3. Trigger forced mode measurement
+4. Wait for measurement completion (~1140ms with gas heater)
+5. Read raw sensor data (T/H/P/Gas)
+6. Feed data to BSEC library via `bsec_do_steps()`
+7. Extract BSEC virtual sensor outputs (IAQ, CO2, VOC, etc.)
+8. Auto-save state to NVS every 4 hours
 
 **Data Accuracy:**
-- Temperature: ±1.0°C (typ), ±1.5°C (max)
+- Temperature: ±1.0°C (typ), ±1.5°C (max) - heat-compensated
 - Humidity: ±3% RH (typ)
 - Pressure: ±1.0 hPa (typ)
+- IAQ: 0-500 (0-50=good, 51-100=average, 101-150=little bad, 151-200=bad, 201-300=worse, 301-500=very bad)
+- CO2 equivalent: 400-60000 ppm (estimated)
+- Breath VOC: 0.5-1000+ ppm (estimated)
 
 **NVS State Management:**
 - Namespace: `bme68x_state`
-- Saves BSEC calibration state every 4 hours (future IAQ use)
+- Auto-saves BSEC calibration state every 4 hours
 - Persists across reboots for faster IAQ convergence
+- State includes gas sensor baseline and calibration history
+- CAN command 0x0A8/0x0A9 triggers immediate save
 
-**Future IAQ/CO2/VOC Support:**
+**IAQ Calibration Timeline:**
+- **Accuracy 0:** Uncalibrated (first 5 minutes)
+- **Accuracy 1:** Low accuracy (5-30 minutes) - usable but not optimal
+- **Accuracy 2:** Medium accuracy (30+ minutes) - good for most applications
+- **Accuracy 3:** High accuracy (hours to days) - fully calibrated baseline
+- Calibration persists in NVS, so subsequent boots start with saved accuracy
 
-To enable air quality outputs, the following changes are needed:
+**Critical Bug Fixes (Oct 2025):**
 
-1. **Enable heater:**
-   ```c
-   heatr_conf.enable = BME68X_ENABLE;
-   heatr_conf.heatr_temp = 320;  // °C (typical for IAQ)
-   heatr_conf.heatr_dur = 150;   // ms
-   ```
+1. ✅ **BSEC Subscription Fixed** - Struct field order was incorrect
+   - **Wrong:** `{BSEC_OUTPUT_IAQ, BSEC_SAMPLE_RATE_LP}`
+   - **Correct:** `{ .sample_rate = BSEC_SAMPLE_RATE_LP, .sensor_id = BSEC_OUTPUT_IAQ }`
+   - Used designated initializers to prevent field order mismatch
+   - Location: bme680_bsec.c:370-382
 
-2. **Setup BSEC subscription:**
-   ```c
-   bsec_sensor_configuration_t requested_virtual_sensors[] = {
-       {BSEC_OUTPUT_STATIC_IAQ, BSEC_SAMPLE_RATE_LP},
-       // Note: Must use outputs supported by loaded config blob
-       // Check BSEC_OUTPUT_INCLUDED bitfield (0x1279EF for current config)
-   };
-   ```
+2. ✅ **NVS Flash Initialization** - NVS was never initialized
+   - Added `nvs_flash_init()` in app_main() before sensor initialization
+   - Without this, all calibration save/load operations silently failed
+   - Location: main.c:317-325
 
-3. **Use BSEC-driven timing:**
-   - Call `bsec_sensor_control()` before each measurement
-   - Apply BSEC-provided sensor settings (not fixed settings)
-   - Read at intervals specified by BSEC (typically 3s for LP mode)
-
-4. **Wait for calibration:**
-   - IAQ accuracy starts at 0 (uncalibrated)
-   - Takes ~5 minutes to reach accuracy 1
-   - Takes ~30 minutes to reach accuracy 3 (fully calibrated)
-   - Calibration persists in NVS across reboots
-
-**Known Issues:**
-- BSEC subscription currently fails with warning 10 (incompatible output combination)
-- Need to determine which virtual sensor outputs the loaded config actually supports
-- May need different BSEC config blob for IAQ support
+3. ✅ **Hardware Defect Detected** - Original BME680 board had defective gas sensor
+   - Symptoms: Gas measurements timed out, CTRL_MEAS corrupted to 0x00
+   - Diagnostics: Extensive register dumps and timing analysis
+   - Solution: Replaced BME680 board - new sensor works perfectly
+   - Measurement time with working sensor: 1142ms (expected for 1000ms heater duration)
 
 ### CAN Protocol
 
-**Message IDs:**
-- `0x0A0`: RX - Master STOP command
-- `0x0A1`: RX - Master START command
-- `0x0A2`: TX - Lux data (1 Hz, normal operation)
-- `0x0A3`: TX - Calibration commands (unused in current build)
-- `0x0A4`: TX - Calibration responses (unused in current build)
-- `0x0A5`: TX - Raw sensor data (unused in current build)
+**Control Messages (RX - from master to ESP32):**
+- `0x0A0`: STOP - Stop sensor transmission
+- `0x0A1`: START - Start sensor transmission (auto-start at boot if no CAN activity)
+- `0x0A8`: SHUTDOWN - Graceful shutdown (save BSEC state, stop TX, keep ESP32 running)
+- `0x0A9`: REBOOT - Save BSEC state and reboot ESP32
+- `0x0AA`: FACTORY_RESET - Clear BSEC calibration (factory default) and reboot
 
-**Lux Data Format (0x0A2):**
+**Data Messages (TX - from ESP32 to master):**
+- `0x0A2`: Ambient light data (1 Hz, VEML7700 or OPT4001)
+- `0x0A3`: BME680 environmental data (0.33 Hz, T/H/P)
+- `0x0A4`: BME680 air quality data (0.33 Hz, IAQ/CO2/VOC)
+
+**Message Format 0x0A2 (Ambient Light):**
 ```
 Byte 0-2: Lux value (uint24_t, little-endian, 0-16,777,215)
 Byte 3:   Status (0x00=OK, 0x01=Error)
 Byte 4:   Sequence counter (rolls over)
-Byte 5:   Current config index (0-20 for VEML7700, 100-111 for OPT4001)
+Byte 5:   Config index (0-20=VEML7700, 100-111=OPT4001)
 Byte 6-7: Checksum (sum of bytes 0-5, uint16_t LE)
+```
+
+**Message Format 0x0A3 (Environmental - T/H/P):**
+```
+Byte 0-1: Temperature (int16_t, 0.1°C resolution, -40.0 to 85.0°C)
+Byte 2-3: Humidity (uint16_t, 0.1% resolution, 0.0 to 100.0%)
+Byte 4-5: Pressure (uint16_t, 0.1 hPa resolution, 300.0 to 1100.0 hPa)
+Byte 6:   Reserved (0x00)
+Byte 7:   Status (0x00=OK, 0x01=Error)
+```
+
+**Message Format 0x0A4 (Air Quality - IAQ/CO2/VOC):**
+```
+Byte 0-1: IAQ (uint16_t, 0-500 index)
+Byte 2:   IAQ Accuracy (uint8_t, 0-3: 0=uncalibrated, 3=fully calibrated)
+Byte 3-4: CO2 equivalent (uint16_t, ppm)
+Byte 5-6: Breath VOC equivalent (uint16_t, ppm)
+Byte 7:   Status (0x00=OK, 0x01=Error)
+```
+
+**Control Command Usage Examples:**
+```bash
+# Normal operation control
+cansend can0 0A1#              # Start transmission
+cansend can0 0A0#              # Stop transmission
+
+# Graceful shutdown before power-off
+cansend can0 0A8#              # Save calibration, stop TX
+# (wait for "BSEC state saved" message, then safe to power off)
+
+# Reboot ESP32 (preserves calibration)
+cansend can0 0A9#              # Save state and reboot
+
+# Factory reset (clear calibration)
+cansend can0 0AA#              # Reset to factory defaults, reboot
 ```
 
 ### Pin Assignments
@@ -391,52 +443,50 @@ GPIO7:  I2C SCL (Shared bus for all I2C sensors)
 
 ### When Modifying BME680 Driver
 
-**Current Simplified Mode (T/H/P only):**
+**Current Full IAQ Mode (Production):**
 
-1. **Sensor configuration is FIXED** - not driven by BSEC
-   - T_os=8x, H_os=2x, P_os=4x (high accuracy)
-   - Heater disabled (no gas measurement)
-   - Forced mode with fixed 3-second interval
+1. **Sensor configuration is BSEC-DRIVEN** - not fixed
+   - Call `bsec_sensor_control()` before EVERY measurement
+   - Apply BSEC-provided settings (T/H/P oversampling, heater profile)
+   - BSEC timing is CRITICAL - respect `next_call` timing (error 100 if late)
+   - Gas heater: 380°C for 1000ms (BSEC-controlled)
 
-2. **Values come from raw sensor** - not BSEC outputs
-   - Direct reading from `bme68x_data` structure
-   - BSEC processing runs in background but outputs are not used
-   - This is intentional to avoid broken BSEC subscription
+2. **Values come from BSEC virtual sensors** - not raw sensor
+   - Feed raw data to BSEC via `bsec_do_steps()`
+   - Extract outputs from `bsec_output_t` array
+   - Handle all 8 subscribed virtual sensors (IAQ, CO2, VOC, T, H, P, status flags)
+   - Use heat-compensated temperature (not raw temperature)
 
-3. **Testing:** Verify T/H/P accuracy
-   - Temperature should track room temperature (±1.5°C)
-   - Humidity should be reasonable (20-80% indoors)
-   - Pressure should match local barometric pressure (~980-1030 hPa)
+3. **Struct initialization MUST use designated initializers**
+   - **CRITICAL:** Field order in `bsec_sensor_configuration_t` is {sample_rate, sensor_id}
+   - **Wrong:** `{BSEC_OUTPUT_IAQ, BSEC_SAMPLE_RATE_LP}` (will fail with warning 10)
+   - **Correct:** `{ .sample_rate = BSEC_SAMPLE_RATE_LP, .sensor_id = BSEC_OUTPUT_IAQ }`
+   - Location: bme680_bsec.c:370-382
 
-**Future IAQ Mode (when enabling air quality):**
+4. **NVS initialization is MANDATORY**
+   - Must call `nvs_flash_init()` in app_main() BEFORE sensor init
+   - Without NVS, all state save/load operations silently fail
+   - Calibration will be lost on every reboot
+   - Location: main.c:317-325
 
-1. **BSEC subscription must be fixed first**
-   - Current issue: Warning 10 (incompatible output combination)
-   - Need to find which virtual sensors the config blob actually supports
-   - May need different BSEC config blob
-
-2. **Enable heater carefully**
-   - Temperature: 320°C typical for IAQ
-   - Duration: 150ms per measurement
-   - Increases power consumption significantly
-   - Adds self-heating offset to temperature reading
-
-3. **BSEC timing is CRITICAL**
-   - Must call `bsec_sensor_control()` before EVERY measurement
-   - Must apply BSEC-provided settings (not fixed settings)
-   - Must respect BSEC next_call timing (error 100 if called too early/late)
-
-4. **Calibration takes time**
-   - IAQ accuracy 0 = uncalibrated (first 5 minutes)
-   - IAQ accuracy 1 = low accuracy (5-30 minutes)
-   - IAQ accuracy 2 = medium accuracy (30+ minutes)
-   - IAQ accuracy 3 = high accuracy (hours of operation)
+5. **Calibration takes time**
+   - IAQ accuracy 0 = uncalibrated (first 5 minutes) - values unreliable
+   - IAQ accuracy 1 = low accuracy (5-30 minutes) - usable but not optimal
+   - IAQ accuracy 2 = medium accuracy (30+ minutes) - good for most applications
+   - IAQ accuracy 3 = high accuracy (hours to days) - fully calibrated baseline
    - State persists in NVS, so don't clear NVS during testing
+   - Use CAN command 0x0A8 or 0x0A9 to save state before power-off
 
-5. **Stack size is critical**
+6. **Stack size is critical**
    - BME680 task requires 10KB stack minimum
    - BSEC library uses significant stack space
    - Stack overflow will cause silent crashes
+
+7. **Hardware defects can occur**
+   - Symptoms: Gas measurements timeout, CTRL_MEAS corrupted to 0x00
+   - Diagnostics: Add register dumps (CTRL_GAS_0/1, MEAS_STATUS_0)
+   - If gas sensor circuit is defective, replace BME680 board
+   - Expected measurement time: ~1140ms (with 1000ms heater duration)
 
 ### When Modifying CAN Protocol
 
@@ -514,17 +564,51 @@ See `EXPANSION_GUIDE.md` for detailed multi-sensor expansion plan (BME680, LD241
 - Increase stack size to 3072 bytes minimum
 - Check in `main.c`: `xTaskCreate(sensor_poll_task, "SENSOR_POLL", 3072, ...)`
 
+**BME680 BSEC subscription fails (warning 10):**
+- Root cause: Struct field order mismatch in initialization
+- Check `bsec_sensor_configuration_t` uses designated initializers
+- Correct format: `{ .sample_rate = X, .sensor_id = Y }`
+- See fix in bme680_bsec.c:370-382
+
+**BME680 calibration not persisting across reboots:**
+- Check if NVS flash is initialized in app_main()
+- Must call `nvs_flash_init()` before sensor init
+- Verify "BSEC state saved to NVS" message appears every 4 hours
+- Use CAN command 0x0A9 to test save/reboot cycle
+
+**BME680 gas measurements timeout:**
+- Check measurement completion time (should be ~1140ms)
+- If >3 seconds with no completion, likely hardware defect
+- Add diagnostic register dumps (CTRL_MEAS, MEAS_STATUS_0)
+- If CTRL_MEAS corrupts to 0x00, replace BME680 board
+
+**IAQ/CO2/VOC values stuck at defaults (50/500/0.5):**
+- Check IAQ accuracy - must be >0 for valid data
+- Accuracy 0 = uncalibrated (wait 5+ minutes)
+- Verify gas heater is enabled (should see 380°C in logs)
+- Check BSEC virtual sensor subscription succeeded (no warning 10)
+
+**"Unknown BSEC output sensor_id=12/13" warnings:**
+- These are stabilization_status and run_in_status outputs
+- Not critical for operation, just status flags
+- Can be handled at DEBUG level or ignored
+- Fixed in latest version (bme680_bsec.c:795-803)
+
 ## Testing Checklist
 
 ### Unit Testing
 - [ ] I2C communication (read/write registers)
-- [ ] Sensor auto-detection (VEML7700 @ 0x10, OPT4001 @ 0x44)
+- [ ] Sensor auto-detection (VEML7700 @ 0x10, OPT4001 @ 0x44, BME680 @ 0x76/0x77)
 - [ ] All 21 VEML7700 configurations apply correctly
 - [ ] OPT4001 device ID verification (0x121)
 - [ ] OPT4001 config register write/readback
+- [ ] BME680 device ID verification (variant 0x00 or 0x01)
+- [ ] BSEC library initialization and config loading
+- [ ] BSEC virtual sensor subscription (8 outputs)
 - [ ] Checksum calculation for CAN messages
 - [ ] Moving average filter output (VEML7700)
 - [ ] 3-byte lux encoding/decoding
+- [ ] NVS flash initialization
 
 ### Integration Testing - VEML7700
 - [ ] Auto-ranging across 0-120,000 lux
@@ -532,24 +616,47 @@ See `EXPANSION_GUIDE.md` for detailed multi-sensor expansion plan (BME680, LD241
 - [ ] No oscillation between configs
 - [ ] Smooth transitions: indoor (500 lux) → outdoor (70K lux)
 - [ ] Calibration accuracy vs reference meter (indoor and sunlight)
-- [ ] Config index 0-20 reported correctly in CAN messages
+- [ ] Config index 0-20 reported correctly in CAN messages (0x0A2)
 
 ### Integration Testing - OPT4001
 - [ ] Hardware auto-ranging across 0-2.2M lux
 - [ ] Accuracy vs reference meter: ±2% at 100 lux, 1K lux, 10K+ lux
 - [ ] Range transitions smooth (config 100-111)
-- [ ] Config index 100-111 reported correctly in CAN messages
+- [ ] Config index 100-111 reported correctly in CAN messages (0x0A2)
 - [ ] No stack overflow with powf() usage
 
-### Integration Testing - Common
-- [ ] START/STOP commands work
+### Integration Testing - BME680
+- [ ] Sensor auto-detection at both addresses (0x76/0x77)
+- [ ] BSEC subscription succeeds (no warning 10)
+- [ ] Gas measurements complete in ~1140ms (not timeout)
+- [ ] T/H/P values reasonable (T: room temp ±1.5°C, H: 20-80%, P: 980-1030 hPa)
+- [ ] IAQ calibration progresses (accuracy 0→1→2→3 over time)
+- [ ] CO2 and VOC values update (not stuck at 500/0.5)
+- [ ] Environmental data CAN messages (0x0A3) at 0.33 Hz
+- [ ] Air quality CAN messages (0x0A4) at 0.33 Hz
+- [ ] NVS state save every 4 hours
+- [ ] Calibration persists across reboot (test with 0x0A9 command)
+
+### Integration Testing - CAN Commands
+- [ ] START command (0x0A1) - transmission begins
+- [ ] STOP command (0x0A0) - transmission stops
+- [ ] SHUTDOWN command (0x0A8) - state saved, TX stops, ESP32 keeps running
+- [ ] REBOOT command (0x0A9) - state saved, ESP32 reboots, calibration restored
+- [ ] FACTORY_RESET command (0x0AA) - calibration cleared, IAQ accuracy returns to 0
+
+### Integration Testing - Multi-Sensor
+- [ ] All sensors coexist on shared I2C bus
+- [ ] No I2C contention or timeouts
+- [ ] CAN messages for all sensors transmitted correctly
 - [ ] Sensor type correctly identified from config index
 
 ### Reliability Testing
-- [ ] 24-hour continuous operation
+- [ ] 24-hour continuous operation with all sensors
 - [ ] No memory leaks (check heap)
 - [ ] Handles sensor disconnect gracefully
 - [ ] CAN bus error recovery
+- [ ] IAQ calibration reaches accuracy 3 within expected timeframe
+- [ ] State persistence across multiple reboots
 
 ## Configuration Options
 

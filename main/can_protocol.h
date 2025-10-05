@@ -11,6 +11,9 @@
 /* Control Messages (RX - from master to ESP32) */
 #define ID_MASTER_STOP_CMD      0x0A0  /* Stop sensor transmission */
 #define ID_MASTER_START_CMD     0x0A1  /* Start sensor transmission */
+#define ID_MASTER_SHUTDOWN_CMD  0x0A8  /* Graceful shutdown (save state, keep running) */
+#define ID_MASTER_REBOOT_CMD    0x0A9  /* Save state and reboot ESP32 */
+#define ID_MASTER_FACTORY_RST   0x0AA  /* Factory reset (clear calibration, reboot) */
 
 /* Sensor Data Messages (TX - from ESP32 to master) */
 #define ID_SENSOR_VEML7700      0x0A2  /* Ambient light (1 Hz) */
