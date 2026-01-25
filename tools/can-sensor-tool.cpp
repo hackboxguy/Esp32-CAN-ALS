@@ -944,22 +944,229 @@ int cmd_monitor(CanSocket& can, const Config& config) {
     return 0;
 }
 
-int cmd_set_node_id(CanSocket& /* can */, const Config& /* config */) {
-    // TODO: Implement in Phase 4
-    fprintf(stderr, "Error: set-node-id command not yet implemented\n");
-    return 1;
+/* ============================================================================
+ * INFO Response Parsing
+ * ========================================================================== */
+
+struct InfoResponse {
+    uint8_t node_id;
+    uint8_t fw_major;
+    uint8_t fw_minor;
+    uint8_t fw_patch;
+    uint8_t sensor_flags;
+    uint8_t als_type;
+    uint8_t status_flags;
+};
+
+static bool parse_info_response(const struct can_frame& frame, InfoResponse& info) {
+    if (frame.can_dlc < 7) return false;
+
+    info.node_id = frame.data[0];
+    info.fw_major = frame.data[1];
+    info.fw_minor = frame.data[2];
+    info.fw_patch = frame.data[3];
+    info.sensor_flags = frame.data[4];
+    info.als_type = frame.data[5];
+    info.status_flags = frame.data[6];
+
+    return true;
 }
 
-int cmd_info(CanSocket& /* can */, const Config& /* config */) {
-    // TODO: Implement in Phase 4
-    fprintf(stderr, "Error: info command not yet implemented\n");
-    return 1;
+static const char* get_als_type_name(uint8_t als_type) {
+    switch (als_type) {
+        case 0: return "None";
+        case 1: return "VEML7700";
+        case 2: return "OPT4001";
+        default: return "Unknown";
+    }
 }
 
-int cmd_discover(CanSocket& /* can */, const Config& /* config */) {
-    // TODO: Implement in Phase 4
-    fprintf(stderr, "Error: discover command not yet implemented\n");
-    return 1;
+static void print_info_response(const InfoResponse& info, OutputFormat format) {
+    bool has_als = (info.sensor_flags & 0x01) != 0;
+    bool has_bme = (info.sensor_flags & 0x02) != 0;
+    bool has_ld2410 = (info.sensor_flags & 0x04) != 0;
+    bool has_mq3 = (info.sensor_flags & 0x08) != 0;
+    bool tx_active = (info.status_flags & 0x01) != 0;
+
+    switch (format) {
+        case OutputFormat::HUMAN:
+            printf("Device Info (Node %d):\n", info.node_id);
+            printf("  Firmware:    v%d.%d.%d\n", info.fw_major, info.fw_minor, info.fw_patch);
+            printf("  Base Addr:   0x%03X\n", can_protocol::BASE_ADDR_NODE_0 + info.node_id * can_protocol::NODE_ADDR_SPACING);
+            printf("  Sensors:     ");
+            if (has_als) printf("ALS(%s) ", get_als_type_name(info.als_type));
+            if (has_bme) printf("BME680 ");
+            if (has_ld2410) printf("LD2410 ");
+            if (has_mq3) printf("MQ-3 ");
+            if (!has_als && !has_bme && !has_ld2410 && !has_mq3) printf("(none)");
+            printf("\n");
+            printf("  TX Active:   %s\n", tx_active ? "Yes" : "No");
+            break;
+
+        case OutputFormat::JSON:
+            printf("{\"type\":\"info\",\"node\":%d,\"firmware\":\"%d.%d.%d\","
+                   "\"base_addr\":\"0x%03X\",\"sensors\":{\"als\":%s,\"als_type\":\"%s\","
+                   "\"bme680\":%s,\"ld2410\":%s,\"mq3\":%s},\"tx_active\":%s}\n",
+                   info.node_id, info.fw_major, info.fw_minor, info.fw_patch,
+                   can_protocol::BASE_ADDR_NODE_0 + info.node_id * can_protocol::NODE_ADDR_SPACING,
+                   has_als ? "true" : "false", get_als_type_name(info.als_type),
+                   has_bme ? "true" : "false",
+                   has_ld2410 ? "true" : "false",
+                   has_mq3 ? "true" : "false",
+                   tx_active ? "true" : "false");
+            break;
+
+        case OutputFormat::CSV:
+            printf("info,%d,%d.%d.%d,0x%03X,%d,%s,%d,%d,%d,%d\n",
+                   info.node_id, info.fw_major, info.fw_minor, info.fw_patch,
+                   can_protocol::BASE_ADDR_NODE_0 + info.node_id * can_protocol::NODE_ADDR_SPACING,
+                   has_als ? 1 : 0, get_als_type_name(info.als_type),
+                   has_bme ? 1 : 0, has_ld2410 ? 1 : 0, has_mq3 ? 1 : 0,
+                   tx_active ? 1 : 0);
+            break;
+    }
+}
+
+/* ============================================================================
+ * Set Node ID Command
+ * ========================================================================== */
+
+int cmd_set_node_id(CanSocket& can, const Config& config) {
+    uint32_t can_id = can_protocol::make_can_id(config.node_id, can_protocol::MsgOffset::SET_NODE_ID);
+
+    info("Setting node %d to new ID %d (CAN ID 0x%03X)...\n",
+         config.node_id, config.new_node_id, can_id);
+
+    uint8_t data[8] = {0};
+    data[0] = static_cast<uint8_t>(config.new_node_id);
+
+    if (!can.send(can_id, data, 8)) {
+        fprintf(stderr, "Error: Failed to send SET_NODE_ID command\n");
+        return 1;
+    }
+
+    info("SET_NODE_ID command sent. Device will reboot with new node ID %d.\n",
+         config.new_node_id);
+    info("New base address will be 0x%03X\n",
+         can_protocol::BASE_ADDR_NODE_0 + config.new_node_id * can_protocol::NODE_ADDR_SPACING);
+
+    return 0;
+}
+
+/* ============================================================================
+ * Info Command
+ * ========================================================================== */
+
+int cmd_info(CanSocket& can, const Config& config) {
+    uint32_t get_info_id = can_protocol::make_can_id(config.node_id, can_protocol::MsgOffset::GET_INFO);
+    uint32_t info_resp_id = can_protocol::make_can_id(config.node_id, can_protocol::MsgOffset::INFO_RESPONSE);
+
+    info("Querying node %d info (CAN ID 0x%03X)...\n", config.node_id, get_info_id);
+
+    // Send GET_INFO request
+    if (!can.send(get_info_id)) {
+        fprintf(stderr, "Error: Failed to send GET_INFO command\n");
+        return 1;
+    }
+
+    // Wait for INFO_RESPONSE (500ms timeout)
+    struct can_frame frame;
+    auto start = std::chrono::steady_clock::now();
+    const int timeout_ms = 500;
+
+    while (true) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+
+        if (elapsed >= timeout_ms) {
+            fprintf(stderr, "Error: No response from node %d (timeout)\n", config.node_id);
+            return 1;
+        }
+
+        int remaining = timeout_ms - static_cast<int>(elapsed);
+        if (can.receive(frame, remaining)) {
+            if (frame.can_id == info_resp_id) {
+                InfoResponse resp;
+                if (parse_info_response(frame, resp)) {
+                    print_info_response(resp, config.format);
+                    return 0;
+                }
+            }
+        }
+    }
+}
+
+/* ============================================================================
+ * Discover Command
+ * ========================================================================== */
+
+int cmd_discover(CanSocket& can, const Config& config) {
+    info("Discovering sensor nodes on %s...\n", can.interface().c_str());
+
+    // Track which nodes responded
+    bool node_found[can_protocol::MAX_NODE_ID + 1] = {false};
+    int nodes_found = 0;
+
+    // Send PING to all possible node addresses
+    for (int node = 0; node <= can_protocol::MAX_NODE_ID; node++) {
+        uint32_t ping_id = can_protocol::make_can_id(node, can_protocol::MsgOffset::PING);
+        can.send(ping_id);
+    }
+
+    // Wait for PONG responses (300ms total)
+    auto start = std::chrono::steady_clock::now();
+    const int timeout_ms = 300;
+
+    while (true) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+
+        if (elapsed >= timeout_ms) {
+            break;
+        }
+
+        struct can_frame frame;
+        int remaining = timeout_ms - static_cast<int>(elapsed);
+        if (can.receive(frame, remaining)) {
+            // Check if this is a PONG response
+            int node = can_protocol::extract_node_id(frame.can_id);
+            if (node >= 0 && node <= can_protocol::MAX_NODE_ID) {
+                can_protocol::MsgOffset offset = can_protocol::extract_offset(frame.can_id);
+                if (offset == can_protocol::MsgOffset::PONG && !node_found[node]) {
+                    node_found[node] = true;
+                    nodes_found++;
+
+                    uint8_t reported_node = frame.data[0];
+
+                    switch (config.format) {
+                        case OutputFormat::HUMAN:
+                            printf("  Node %d found (base 0x%03X)\n", reported_node,
+                                   can_protocol::BASE_ADDR_NODE_0 + reported_node * can_protocol::NODE_ADDR_SPACING);
+                            break;
+                        case OutputFormat::JSON:
+                            printf("{\"type\":\"discover\",\"node\":%d,\"base_addr\":\"0x%03X\"}\n",
+                                   reported_node,
+                                   can_protocol::BASE_ADDR_NODE_0 + reported_node * can_protocol::NODE_ADDR_SPACING);
+                            break;
+                        case OutputFormat::CSV:
+                            printf("discover,%d,0x%03X\n", reported_node,
+                                   can_protocol::BASE_ADDR_NODE_0 + reported_node * can_protocol::NODE_ADDR_SPACING);
+                            break;
+                    }
+                }
+            }
+        }
+    }
+
+    if (config.format == OutputFormat::HUMAN) {
+        if (nodes_found == 0) {
+            printf("No sensor nodes found.\n");
+        } else {
+            printf("\nFound %d node(s).\n", nodes_found);
+        }
+    }
+
+    return 0;
 }
 
 /* ============================================================================

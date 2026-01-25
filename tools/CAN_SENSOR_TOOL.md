@@ -214,21 +214,21 @@ Byte 1-7: Reserved (0x00)
 - [x] Test: Monitor existing ESP32 sensor output
 
 ### Phase 4: Node ID Management (Tool Side)
-- [ ] Implement `set-node-id` command
-- [ ] Implement `info` command (send GET_INFO, parse response)
-- [ ] Implement `discover` command (ping all bases, collect responses)
-- [ ] Add validation for node ID range (0-5)
-- [ ] Test: Commands send correct CAN messages (verify with candump)
+- [x] Implement `set-node-id` command
+- [x] Implement `info` command (send GET_INFO, parse response)
+- [x] Implement `discover` command (ping all bases, collect responses)
+- [x] Add validation for node ID range (0-5)
+- [x] Test: Commands send correct CAN messages (verified with candump)
 
 ### Phase 5: ESP32 Firmware Changes
-- [ ] Add NVS storage for node ID
-- [ ] Load node ID from NVS at boot (default 0 if not set)
-- [ ] Apply node ID offset to all CAN message IDs
-- [ ] Implement SET_NODE_ID handler (save to NVS, reboot)
-- [ ] Implement GET_INFO handler (respond with device info)
-- [ ] Implement PING/PONG handler for discovery
-- [ ] Add firmware version constants
-- [ ] Test: Full integration with can-sensor-tool
+- [x] Add NVS storage for node ID
+- [x] Load node ID from NVS at boot (default 0 if not set)
+- [x] Apply node ID offset to all CAN message IDs
+- [x] Implement SET_NODE_ID handler (save to NVS, reboot)
+- [x] Implement GET_INFO handler (respond with device info)
+- [x] Implement PING/PONG handler for discovery
+- [x] Add firmware version constants
+- [x] Test: Full integration with can-sensor-tool
 
 ### Phase 6: Calibration (Future)
 - [ ] Design calibration CAN protocol
@@ -244,31 +244,37 @@ Byte 1-7: Reserved (0x00)
 
 ## ESP32 Firmware Changes Summary
 
-Changes required to support can-sensor-tool:
-
-### New Files
-- None (changes to existing files)
+Changes implemented to support can-sensor-tool:
 
 ### Modified Files
 
+**can_protocol.h:**
+- Added firmware version constants (`FIRMWARE_VERSION_MAJOR/MINOR/PATCH`)
+- Added node ID addressing macros (`CAN_BASE_ADDR()`, `CAN_MSG_ID()`, etc.)
+- Added message offset definitions for all 16 message types
+- Added sensor flags and ALS type constants
+- Added new function declarations for INFO_RESPONSE and PONG messages
+
+**can_protocol.c:**
+- Added `can_format_info_response()` function
+- Added `can_format_pong_response()` function
+- Added `can_set_msg_id()` helper to apply node ID offset
+
 **main.c:**
-- Add `node_id` global variable
-- Load node ID from NVS in `app_main()`
-- Pass node ID to CAN protocol functions
+- Added NVS namespace/key for node ID storage
+- Added `g_node_id` and `g_tx_active` global variables
+- Added `load_node_id_from_nvs()` and `save_node_id_to_nvs()` functions
+- Added `get_sensor_flags()` and `get_als_type()` helper functions
+- Updated `twai_receive_task()` to use node-ID-based CAN IDs
+- Added handlers for SET_NODE_ID, GET_INFO, and PING commands
+- Updated `twai_transmit_task()` to apply node ID offset to all TX messages
+- Updated `app_main()` to load node ID from NVS at boot
 
-**can_protocol.c/h:**
-- Add node ID parameter to message ID calculations
-- Add new message handlers: SET_NODE_ID, GET_INFO, PING
-- Add firmware version constants
-- Add sensor detection flags
-
-**Example changes:**
+**Example node ID addressing:**
 ```c
 // can_protocol.h
 #define CAN_BASE_ADDR(node_id)  (0x0A0 + ((node_id) * 0x10))
-#define CAN_MSG_STOP(node_id)   (CAN_BASE_ADDR(node_id) + 0x00)
-#define CAN_MSG_START(node_id)  (CAN_BASE_ADDR(node_id) + 0x01)
-// ... etc
+#define CAN_MSG_ID(node_id, offset)  (CAN_BASE_ADDR(node_id) + (offset))
 
 #define FIRMWARE_VERSION_MAJOR  1
 #define FIRMWARE_VERSION_MINOR  0
@@ -297,12 +303,12 @@ Changes required to support can-sensor-tool:
 - [x] `--timeout` stops after N seconds
 - [x] `--quiet` suppresses status messages
 
-### Multi-Node (after firmware changes)
-- [ ] `set-node-id` changes node ID and reboots
-- [ ] `info` returns correct device information
-- [ ] `discover` finds all active nodes
-- [ ] Commands with `--node-id=N` target correct node
-- [ ] Multiple nodes coexist on same bus
+### Multi-Node (firmware and tool implemented)
+- [x] `set-node-id` changes node ID and reboots
+- [x] `info` returns correct device information
+- [x] `discover` finds all active nodes
+- [x] Commands with `--node-id=N` target correct node
+- [ ] Multiple nodes coexist on same bus (requires 2+ physical nodes)
 
 ## File Structure
 

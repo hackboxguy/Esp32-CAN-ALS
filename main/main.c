@@ -35,6 +35,10 @@
 #define CAN_DATA_PERIOD_MS      1000
 #define SENSOR_QUEUE_DEPTH      20
 
+/* NVS Configuration */
+#define NVS_NAMESPACE_NODE      "node_config"
+#define NVS_KEY_NODE_ID         "node_id"
+
 /* BME680 sample rate from Kconfig (default 3 seconds for LP mode) */
 #ifndef CONFIG_BME680_SAMPLE_RATE
 #define BME680_SAMPLE_RATE_SEC  3  /* BSEC LP mode: 3 seconds */
@@ -49,6 +53,65 @@ static const char *TAG = "MULTI_SENSOR";
 static SemaphoreHandle_t done_sem;
 static SemaphoreHandle_t start_sem;
 static QueueHandle_t sensor_queue;
+
+/* Node ID configuration (0-5, loaded from NVS) */
+static uint8_t g_node_id = 0;
+static bool g_tx_active = false;  /* Track if transmission is active */
+
+/* ======================== NVS Node ID Functions ======================== */
+
+static esp_err_t load_node_id_from_nvs(uint8_t *node_id) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE_NODE, NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        /* Namespace doesn't exist - use default */
+        *node_id = 0;
+        return ESP_ERR_NVS_NOT_FOUND;
+    }
+
+    err = nvs_get_u8(handle, NVS_KEY_NODE_ID, node_id);
+    nvs_close(handle);
+
+    if (err != ESP_OK) {
+        *node_id = 0;  /* Default to node 0 */
+    }
+
+    /* Validate range */
+    if (*node_id > CAN_MAX_NODE_ID) {
+        ESP_LOGW(TAG, "Invalid node ID %d in NVS, defaulting to 0", *node_id);
+        *node_id = 0;
+    }
+
+    return err;
+}
+
+static esp_err_t save_node_id_to_nvs(uint8_t node_id) {
+    if (node_id > CAN_MAX_NODE_ID) {
+        ESP_LOGE(TAG, "Invalid node ID %d (max %d)", node_id, CAN_MAX_NODE_ID);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE_NODE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS namespace: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    err = nvs_set_u8(handle, NVS_KEY_NODE_ID, node_id);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Node ID %d saved to NVS", node_id);
+    } else {
+        ESP_LOGE(TAG, "Failed to save node ID: %s", esp_err_to_name(err));
+    }
+
+    return err;
+}
 
 /* ======================== Sensor Poll Task ======================== */
 
@@ -160,24 +223,69 @@ static void bme680_sensor_task(void *arg) {
 
 /* ======================== CAN Tasks ======================== */
 
+/* Helper function to get sensor flags */
+static uint8_t get_sensor_flags(void) {
+    uint8_t flags = 0;
+
+    /* Check ALS sensor */
+    if (als_get_sensor_name() != NULL) {
+        flags |= SENSOR_FLAG_ALS;
+    }
+
+#ifdef CONFIG_BME680_ENABLED
+    flags |= SENSOR_FLAG_BME680;
+#endif
+
+    return flags;
+}
+
+/* Helper function to get ALS type */
+static uint8_t get_als_type(void) {
+    const char *name = als_get_sensor_name();
+    if (name == NULL) return ALS_TYPE_NONE;
+
+    /* Check sensor name to determine type */
+    if (strstr(name, "VEML7700") != NULL) return ALS_TYPE_VEML7700;
+    if (strstr(name, "OPT4001") != NULL) return ALS_TYPE_OPT4001;
+
+    return ALS_TYPE_NONE;
+}
+
 static void twai_receive_task(void *arg) {
     twai_message_t rx_msg;
+    twai_message_t tx_msg;
 
-    ESP_LOGI(TAG, "TWAI receive task started");
+    /* Calculate our node's message IDs */
+    uint32_t my_stop_id     = CAN_MSG_ID(g_node_id, CAN_MSG_OFFSET_STOP);
+    uint32_t my_start_id    = CAN_MSG_ID(g_node_id, CAN_MSG_OFFSET_START);
+    uint32_t my_shutdown_id = CAN_MSG_ID(g_node_id, CAN_MSG_OFFSET_SHUTDOWN);
+    uint32_t my_reboot_id   = CAN_MSG_ID(g_node_id, CAN_MSG_OFFSET_REBOOT);
+    uint32_t my_factory_id  = CAN_MSG_ID(g_node_id, CAN_MSG_OFFSET_FACTORY_RST);
+    uint32_t my_setid_id    = CAN_MSG_ID(g_node_id, CAN_MSG_OFFSET_SET_NODE_ID);
+    uint32_t my_getinfo_id  = CAN_MSG_ID(g_node_id, CAN_MSG_OFFSET_GET_INFO);
+    uint32_t my_ping_id     = CAN_MSG_ID(g_node_id, CAN_MSG_OFFSET_PING);
+
+    ESP_LOGI(TAG, "TWAI receive task started (node %d, base 0x%03lX)",
+             g_node_id, (unsigned long)CAN_BASE_ADDR(g_node_id));
 
     while (1) {
         if (twai_receive(&rx_msg, portMAX_DELAY) == ESP_OK) {
-            if (rx_msg.identifier == ID_MASTER_STOP_CMD) {
+            uint32_t id = rx_msg.identifier;
+
+            if (id == my_stop_id) {
                 ESP_LOGI(TAG, "Received STOP command");
+                g_tx_active = false;
                 xSemaphoreTake(done_sem, 0);  /* Clear if set */
                 xSemaphoreGive(done_sem);      /* Signal stop */
-            } else if (rx_msg.identifier == ID_MASTER_START_CMD) {
+
+            } else if (id == my_start_id) {
                 ESP_LOGI(TAG, "Received START command");
                 xSemaphoreTake(start_sem, 0);  /* Clear if set */
                 xSemaphoreGive(start_sem);      /* Signal start */
-            } else if (rx_msg.identifier == ID_MASTER_SHUTDOWN_CMD) {
+
+            } else if (id == my_shutdown_id) {
                 /* Graceful shutdown: Save state, stop transmission, keep running */
-                ESP_LOGI(TAG, "Received SHUTDOWN command - saving BSEC state...");
+                ESP_LOGI(TAG, "Received SHUTDOWN command - saving state...");
 #ifdef CONFIG_BME680_ENABLED
                 if (bme680_save_state() == ESP_OK) {
                     ESP_LOGI(TAG, "BSEC calibration state saved successfully");
@@ -186,10 +294,11 @@ static void twai_receive_task(void *arg) {
                 }
 #endif
                 ESP_LOGI(TAG, "Ready for power-off (ESP32 still running)");
+                g_tx_active = false;
                 xSemaphoreTake(done_sem, 0);
                 xSemaphoreGive(done_sem);  /* Stop transmission */
 
-            } else if (rx_msg.identifier == ID_MASTER_REBOOT_CMD) {
+            } else if (id == my_reboot_id) {
                 /* Save state and reboot */
                 ESP_LOGI(TAG, "Received REBOOT command - saving state and rebooting...");
 #ifdef CONFIG_BME680_ENABLED
@@ -198,19 +307,77 @@ static void twai_receive_task(void *arg) {
                 vTaskDelay(pdMS_TO_TICKS(500));  /* Allow logs to flush */
                 esp_restart();  /* Reboot ESP32 */
 
-            } else if (rx_msg.identifier == ID_MASTER_FACTORY_RST) {
-                /* Factory reset: Clear calibration and reboot */
-                ESP_LOGI(TAG, "Received FACTORY RESET command - clearing calibration...");
+            } else if (id == my_factory_id) {
+                /* Factory reset: Clear calibration and node ID, then reboot */
+                ESP_LOGI(TAG, "Received FACTORY RESET command - clearing all config...");
 #ifdef CONFIG_BME680_ENABLED
                 if (bme680_reset_calibration() == ESP_OK) {
-                    ESP_LOGI(TAG, "BSEC calibration cleared (factory default)");
+                    ESP_LOGI(TAG, "BSEC calibration cleared");
                 } else {
-                    ESP_LOGW(TAG, "Failed to clear calibration");
+                    ESP_LOGW(TAG, "Failed to clear BSEC calibration");
                 }
 #endif
+                /* Clear node ID (reset to 0) */
+                nvs_handle_t handle;
+                if (nvs_open(NVS_NAMESPACE_NODE, NVS_READWRITE, &handle) == ESP_OK) {
+                    nvs_erase_all(handle);
+                    nvs_commit(handle);
+                    nvs_close(handle);
+                    ESP_LOGI(TAG, "Node config cleared (will use default node ID 0)");
+                }
                 ESP_LOGI(TAG, "Rebooting to apply factory reset...");
                 vTaskDelay(pdMS_TO_TICKS(500));  /* Allow logs to flush */
                 esp_restart();  /* Reboot ESP32 */
+
+            } else if (id == my_setid_id) {
+                /* Set new node ID */
+                if (rx_msg.data_length_code >= 1) {
+                    uint8_t new_id = rx_msg.data[0];
+                    ESP_LOGI(TAG, "Received SET_NODE_ID command: %d -> %d", g_node_id, new_id);
+
+                    if (new_id > CAN_MAX_NODE_ID) {
+                        ESP_LOGW(TAG, "Invalid node ID %d (max %d), ignoring", new_id, CAN_MAX_NODE_ID);
+                    } else if (new_id == g_node_id) {
+                        ESP_LOGI(TAG, "Node ID unchanged, no reboot needed");
+                    } else {
+                        /* Save new node ID and reboot */
+                        if (save_node_id_to_nvs(new_id) == ESP_OK) {
+#ifdef CONFIG_BME680_ENABLED
+                            bme680_save_state();  /* Save calibration before reboot */
+#endif
+                            ESP_LOGI(TAG, "Rebooting with new node ID %d...", new_id);
+                            vTaskDelay(pdMS_TO_TICKS(500));
+                            esp_restart();
+                        } else {
+                            ESP_LOGE(TAG, "Failed to save node ID, not rebooting");
+                        }
+                    }
+                }
+
+            } else if (id == my_getinfo_id) {
+                /* Respond with device info */
+                ESP_LOGI(TAG, "Received GET_INFO command");
+
+                uint8_t status_flags = g_tx_active ? STATUS_FLAG_TX_ACTIVE : 0;
+                can_format_info_response(g_node_id, get_sensor_flags(),
+                                         get_als_type(), status_flags, &tx_msg);
+
+                if (twai_transmit(&tx_msg, pdMS_TO_TICKS(100)) == ESP_OK) {
+                    ESP_LOGI(TAG, "Sent INFO_RESPONSE (node=%d, v%d.%d.%d)",
+                             g_node_id, FIRMWARE_VERSION_MAJOR,
+                             FIRMWARE_VERSION_MINOR, FIRMWARE_VERSION_PATCH);
+                } else {
+                    ESP_LOGW(TAG, "Failed to send INFO_RESPONSE");
+                }
+
+            } else if (id == my_ping_id) {
+                /* Respond with PONG for discovery */
+                ESP_LOGD(TAG, "Received PING, sending PONG");
+                can_format_pong_response(g_node_id, &tx_msg);
+
+                if (twai_transmit(&tx_msg, pdMS_TO_TICKS(100)) != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to send PONG");
+                }
             }
         }
     }
@@ -231,13 +398,15 @@ static void twai_transmit_task(void *arg) {
 
         sequence_counter = 0;
         xLastWakeTime = xTaskGetTickCount();
+        g_tx_active = true;
 
-        ESP_LOGI(TAG, "Starting CAN transmission");
+        ESP_LOGI(TAG, "Starting CAN transmission (node %d)", g_node_id);
 
         while (1) {
             /* Check for stop command (non-blocking) */
             if (xSemaphoreTake(done_sem, 0) == pdTRUE) {
                 ESP_LOGI(TAG, "Stopping CAN transmission");
+                g_tx_active = false;
                 break;  /* Exit inner loop, wait for next START */
             }
 
@@ -250,22 +419,25 @@ static void twai_transmit_task(void *arg) {
                          incoming.sensor_id, incoming.data.veml.lux);
             }
 
-            /* Transmit VEML7700 data (always present) */
+            /* Transmit VEML7700/OPT4001 data (always present) */
             can_format_veml7700_message(&latest[SENSOR_VEML7700],
                                         sequence_counter,
                                         &tx_msg);
+            /* Apply node ID offset to message ID */
+            can_set_msg_id(&tx_msg, g_node_id, CAN_MSG_OFFSET_ALS);
 
             ESP_LOGD(TAG, "TX: lux=%.1f, seq=%d, queue_items=%d",
                      latest[SENSOR_VEML7700].data.veml.lux, sequence_counter, queue_count);
 
             if (twai_transmit(&tx_msg, pdMS_TO_TICKS(1000)) != ESP_OK) {
-                ESP_LOGW(TAG, "Failed to transmit VEML7700 message");
+                ESP_LOGW(TAG, "Failed to transmit ALS message");
             }
 
 #ifdef CONFIG_BME680_ENABLED
             /* Transmit BME680 environmental data (if available) */
             if (latest[SENSOR_BME680].timestamp_ms > 0) {
                 can_format_bme_env_message(&latest[SENSOR_BME680], &tx_msg);
+                can_set_msg_id(&tx_msg, g_node_id, CAN_MSG_OFFSET_ENV);
 
                 if (twai_transmit(&tx_msg, pdMS_TO_TICKS(1000)) != ESP_OK) {
                     ESP_LOGW(TAG, "Failed to transmit BME680 environmental message");
@@ -278,6 +450,7 @@ static void twai_transmit_task(void *arg) {
 
                 /* Transmit BME680 air quality data */
                 can_format_bme_aiq_message(&latest[SENSOR_BME680], &tx_msg);
+                can_set_msg_id(&tx_msg, g_node_id, CAN_MSG_OFFSET_AIQ);
 
                 if (twai_transmit(&tx_msg, pdMS_TO_TICKS(1000)) != ESP_OK) {
                     ESP_LOGW(TAG, "Failed to transmit BME680 air quality message");
@@ -314,9 +487,10 @@ static void twai_control_task(void *arg) {
 /* ======================== Main Application ======================== */
 
 void app_main(void) {
-    ESP_LOGI(TAG, "ESP32 Multi-Sensor CAN Node starting...");
+    ESP_LOGI(TAG, "ESP32 Multi-Sensor CAN Node v%d.%d.%d starting...",
+             FIRMWARE_VERSION_MAJOR, FIRMWARE_VERSION_MINOR, FIRMWARE_VERSION_PATCH);
 
-    /* Initialize NVS flash (required for BME680 calibration storage) */
+    /* Initialize NVS flash (required for BME680 calibration and node ID storage) */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_LOGW(TAG, "NVS partition needs erase, erasing...");
@@ -325,6 +499,15 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
     ESP_LOGI(TAG, "NVS flash initialized");
+
+    /* Load node ID from NVS */
+    if (load_node_id_from_nvs(&g_node_id) == ESP_OK) {
+        ESP_LOGI(TAG, "Loaded node ID %d from NVS (base address 0x%03lX)",
+                 g_node_id, (unsigned long)CAN_BASE_ADDR(g_node_id));
+    } else {
+        ESP_LOGI(TAG, "Using default node ID %d (base address 0x%03lX)",
+                 g_node_id, (unsigned long)CAN_BASE_ADDR(g_node_id));
+    }
 
     /* Create semaphores */
     done_sem = xSemaphoreCreateBinary();

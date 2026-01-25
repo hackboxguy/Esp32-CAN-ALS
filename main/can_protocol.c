@@ -173,3 +173,37 @@ void can_format_status_message(uint8_t active_sensors, uint8_t free_heap_kb,
     msg->data[6] = sequence & 0xFF;
     msg->data[7] = (sequence >> 8) & 0xFF;
 }
+
+void can_format_info_response(uint8_t node_id, uint8_t sensor_flags,
+                              uint8_t als_type, uint8_t status_flags,
+                              twai_message_t *msg) {
+    memset(msg, 0, sizeof(twai_message_t));
+
+    msg->identifier = CAN_MSG_ID(node_id, CAN_MSG_OFFSET_INFO_RESP);
+    msg->flags = TWAI_MSG_FLAG_NONE;
+    msg->data_length_code = 8;
+
+    msg->data[0] = node_id;
+    msg->data[1] = FIRMWARE_VERSION_MAJOR;
+    msg->data[2] = FIRMWARE_VERSION_MINOR;
+    msg->data[3] = FIRMWARE_VERSION_PATCH;
+    msg->data[4] = sensor_flags;
+    msg->data[5] = als_type;
+    msg->data[6] = status_flags;
+    msg->data[7] = 0x00;  /* Reserved */
+}
+
+void can_format_pong_response(uint8_t node_id, twai_message_t *msg) {
+    memset(msg, 0, sizeof(twai_message_t));
+
+    msg->identifier = CAN_MSG_ID(node_id, CAN_MSG_OFFSET_PONG);
+    msg->flags = TWAI_MSG_FLAG_NONE;
+    msg->data_length_code = 8;
+
+    msg->data[0] = node_id;
+    /* Bytes 1-7 reserved (already zeroed by memset) */
+}
+
+void can_set_msg_id(twai_message_t *msg, uint8_t node_id, uint8_t offset) {
+    msg->identifier = CAN_MSG_ID(node_id, offset);
+}
