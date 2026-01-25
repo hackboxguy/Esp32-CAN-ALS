@@ -99,7 +99,7 @@ cansend can0 0AA#        # Factory reset
 
 ```
 main/
-├── main.c (~250 lines) - Task coordination and initialization
+├── main.c (~420 lines) - Task coordination and initialization
 │   ├── sensor_poll_task: Periodic sensor reading (1 Hz)
 │   ├── twai_receive_task: CAN command reception (START/STOP)
 │   ├── twai_transmit_task: CAN message transmission
@@ -110,7 +110,7 @@ main/
 │   ├── sensor_data_t: Unified sensor data union
 │   └── Status codes and constants
 │
-├── als_driver.c/h (~150 lines) - Ambient Light Sensor abstraction layer
+├── als_driver.c/h (~270 lines) - Ambient Light Sensor abstraction layer
 │   ├── Runtime auto-detection (I2C address probing)
 │   ├── Unified API for VEML7700 or OPT4001
 │   ├── I2C bus initialization
@@ -130,7 +130,7 @@ main/
 │   ├── Factory-calibrated (SOT-5x3 package)
 │   └── No filtering needed (stable readings)
 │
-├── bme680_bsec.c/h (~800 lines) - BME680/BME688 environmental sensor with BSEC
+├── bme680_bsec.c/h (~1050 lines) - BME680/BME688 environmental sensor with BSEC
 │   ├── Runtime auto-detection (I2C address 0x76/0x77)
 │   ├── BSEC 2.6.1.0 library integration (IAQ/CO2/VOC enabled)
 │   ├── Virtual sensor subscription with 8 BSEC outputs
@@ -139,7 +139,7 @@ main/
 │   ├── NVS state management (auto-saves every 4 hours)
 │   └── Calibration persistence across reboots
 │
-└── can_protocol.c/h (~160 lines) - CAN message formatting
+└── can_protocol.c/h (~300 lines) - CAN message formatting
     ├── Message ID definitions
     ├── can_format_veml7700_message()
     └── Checksum calculation
@@ -529,8 +529,8 @@ See `EXPANSION_GUIDE.md` for detailed multi-sensor expansion plan (BME680, LD241
 
 **Auto-ranging unstable:**
 - Check for light source flickering (AC powered lights)
-- Increase `SETTLE_READINGS_REQUIRED` [main.c:59]
-- Increase moving average samples [main.c:63]
+- Increase `SETTLE_READINGS_REQUIRED` [veml7700_driver.c:46]
+- Increase `MOVING_AVG_SAMPLES` [veml7700_driver.c:49]
 
 **Serial monitor crashes (ESP32-C6 + ESP-IDF 5.5):**
 - Known issue with USB-Serial/JTAG
@@ -676,8 +676,8 @@ See `EXPANSION_GUIDE.md` for detailed multi-sensor expansion plan (BME680, LD241
 
 **main.c:**
 ```c
-#define CAN_DATA_PERIOD_MS      1000    // CAN transmission rate [main.c:26]
-#define SENSOR_QUEUE_DEPTH      20      // Sensor data queue size [main.c:27]
+#define CAN_DATA_PERIOD_MS      1000    // CAN transmission rate [main.c:35]
+#define SENSOR_QUEUE_DEPTH      20      // Sensor data queue size [main.c:36]
 ```
 
 **veml7700_driver.c:**
@@ -710,8 +710,14 @@ The codebase has been refactored with a **modular, queue-based architecture** re
 - ✅ Validated against reference lux meter (±1.4% accuracy at 70K lux)
 - ✅ Updated calibration utility for 3-byte lux parsing
 
+**Phase 1 (Completed - BME680/BME688 Integration):**
+- ✅ Added BME680/BME688 environmental sensor with BSEC 2.6.1.0
+- ✅ Full IAQ mode with 8 virtual sensor outputs
+- ✅ NVS state persistence for calibration
+- ✅ CAN messages 0x0A3 (T/H/P) and 0x0A4 (IAQ/CO2/VOC)
+- ✅ Graceful shutdown commands (0x0A8, 0x0A9, 0x0AA)
+
 **Next Phases (Planned):**
-- Phase 1: Add BME680 environmental sensor with BSEC 2.x
 - Phase 2: Add HLK-LD2410 human presence radar (UART)
 - Phase 3: Add BME688 air quality sensor (enhanced BSEC)
 - Phase 4: Add MQ-3 alcohol/VOC gas sensor (ADC)
