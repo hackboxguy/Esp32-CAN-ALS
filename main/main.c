@@ -9,6 +9,7 @@
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <esp_system.h>
+#include <esp_ota_ops.h>
 #include <nvs_flash.h>
 #include <driver/twai.h>
 
@@ -17,9 +18,12 @@
 #include "can_protocol.h"
 
 /* Conditional BME680 support */
-#ifdef CONFIG_BME680_ENABLED
+#if defined(CONFIG_BME680_ENABLED) && BSEC_LIBRARY_AVAILABLE
 #include "bme680_bsec.h"
 #endif
+
+/* OTA firmware update support */
+#include "ota_handler.h"
 
 /* ======================== Configuration ======================== */
 
@@ -154,7 +158,7 @@ static void sensor_poll_task(void *arg) {
 
 /* ======================== BME680 Sensor Task ======================== */
 
-#ifdef CONFIG_BME680_ENABLED
+#if defined(CONFIG_BME680_ENABLED) && BSEC_LIBRARY_AVAILABLE
 static void bme680_sensor_task(void *arg) {
     sensor_data_t msg;
     bme68x_data_t bme_data;
@@ -232,7 +236,7 @@ static uint8_t get_sensor_flags(void) {
         flags |= SENSOR_FLAG_ALS;
     }
 
-#ifdef CONFIG_BME680_ENABLED
+#if defined(CONFIG_BME680_ENABLED) && BSEC_LIBRARY_AVAILABLE
     flags |= SENSOR_FLAG_BME680;
 #endif
 
@@ -249,6 +253,58 @@ static uint8_t get_als_type(void) {
     if (strstr(name, "OPT4001") != NULL) return ALS_TYPE_OPT4001;
 
     return ALS_TYPE_NONE;
+}
+
+/* Helper function to get partition info byte */
+static uint8_t get_partition_info(void) {
+    uint8_t partition_type = PARTITION_TYPE_UNKNOWN;
+    uint8_t ota_state = OTA_IMG_STATE_UNDEFINED;
+
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (running) {
+        /* Determine partition type from subtype */
+        switch (running->subtype) {
+            case ESP_PARTITION_SUBTYPE_APP_FACTORY:
+                partition_type = PARTITION_TYPE_FACTORY;
+                break;
+            case ESP_PARTITION_SUBTYPE_APP_OTA_0:
+                partition_type = PARTITION_TYPE_OTA_0;
+                break;
+            case ESP_PARTITION_SUBTYPE_APP_OTA_1:
+                partition_type = PARTITION_TYPE_OTA_1;
+                break;
+            default:
+                partition_type = PARTITION_TYPE_UNKNOWN;
+                break;
+        }
+
+        /* Get OTA image state (only meaningful for OTA partitions) */
+        esp_ota_img_states_t img_state;
+        if (esp_ota_get_state_partition(running, &img_state) == ESP_OK) {
+            switch (img_state) {
+                case ESP_OTA_IMG_NEW:
+                    ota_state = OTA_IMG_STATE_NEW;
+                    break;
+                case ESP_OTA_IMG_PENDING_VERIFY:
+                    ota_state = OTA_IMG_STATE_PENDING;
+                    break;
+                case ESP_OTA_IMG_VALID:
+                    ota_state = OTA_IMG_STATE_VALID;
+                    break;
+                case ESP_OTA_IMG_INVALID:
+                    ota_state = OTA_IMG_STATE_INVALID;
+                    break;
+                case ESP_OTA_IMG_ABORTED:
+                    ota_state = OTA_IMG_STATE_ABORTED;
+                    break;
+                default:
+                    ota_state = OTA_IMG_STATE_UNDEFINED;
+                    break;
+            }
+        }
+    }
+
+    return PARTITION_INFO_PACK(partition_type, ota_state);
 }
 
 static void twai_receive_task(void *arg) {
@@ -286,7 +342,7 @@ static void twai_receive_task(void *arg) {
             } else if (id == my_shutdown_id) {
                 /* Graceful shutdown: Save state, stop transmission, keep running */
                 ESP_LOGI(TAG, "Received SHUTDOWN command - saving state...");
-#ifdef CONFIG_BME680_ENABLED
+#if defined(CONFIG_BME680_ENABLED) && BSEC_LIBRARY_AVAILABLE
                 if (bme680_save_state() == ESP_OK) {
                     ESP_LOGI(TAG, "BSEC calibration state saved successfully");
                 } else {
@@ -301,7 +357,7 @@ static void twai_receive_task(void *arg) {
             } else if (id == my_reboot_id) {
                 /* Save state and reboot */
                 ESP_LOGI(TAG, "Received REBOOT command - saving state and rebooting...");
-#ifdef CONFIG_BME680_ENABLED
+#if defined(CONFIG_BME680_ENABLED) && BSEC_LIBRARY_AVAILABLE
                 bme680_save_state();  /* Save current calibration */
 #endif
                 vTaskDelay(pdMS_TO_TICKS(500));  /* Allow logs to flush */
@@ -310,7 +366,7 @@ static void twai_receive_task(void *arg) {
             } else if (id == my_factory_id) {
                 /* Factory reset: Clear calibration and node ID, then reboot */
                 ESP_LOGI(TAG, "Received FACTORY RESET command - clearing all config...");
-#ifdef CONFIG_BME680_ENABLED
+#if defined(CONFIG_BME680_ENABLED) && BSEC_LIBRARY_AVAILABLE
                 if (bme680_reset_calibration() == ESP_OK) {
                     ESP_LOGI(TAG, "BSEC calibration cleared");
                 } else {
@@ -342,7 +398,7 @@ static void twai_receive_task(void *arg) {
                     } else {
                         /* Save new node ID and reboot */
                         if (save_node_id_to_nvs(new_id) == ESP_OK) {
-#ifdef CONFIG_BME680_ENABLED
+#if defined(CONFIG_BME680_ENABLED) && BSEC_LIBRARY_AVAILABLE
                             bme680_save_state();  /* Save calibration before reboot */
 #endif
                             ESP_LOGI(TAG, "Rebooting with new node ID %d...", new_id);
@@ -359,13 +415,16 @@ static void twai_receive_task(void *arg) {
                 ESP_LOGI(TAG, "Received GET_INFO command");
 
                 uint8_t status_flags = g_tx_active ? STATUS_FLAG_TX_ACTIVE : 0;
+                uint8_t partition_info = get_partition_info();
                 can_format_info_response(g_node_id, get_sensor_flags(),
-                                         get_als_type(), status_flags, &tx_msg);
+                                         get_als_type(), status_flags,
+                                         partition_info, &tx_msg);
 
                 if (twai_transmit(&tx_msg, pdMS_TO_TICKS(100)) == ESP_OK) {
-                    ESP_LOGI(TAG, "Sent INFO_RESPONSE (node=%d, v%d.%d.%d)",
+                    ESP_LOGI(TAG, "Sent INFO_RESPONSE (node=%d, v%d.%d.%d, part=%d)",
                              g_node_id, FIRMWARE_VERSION_MAJOR,
-                             FIRMWARE_VERSION_MINOR, FIRMWARE_VERSION_PATCH);
+                             FIRMWARE_VERSION_MINOR, FIRMWARE_VERSION_PATCH,
+                             PARTITION_INFO_TYPE(partition_info));
                 } else {
                     ESP_LOGW(TAG, "Failed to send INFO_RESPONSE");
                 }
@@ -378,6 +437,15 @@ static void twai_receive_task(void *arg) {
                 if (twai_transmit(&tx_msg, pdMS_TO_TICKS(100)) != ESP_OK) {
                     ESP_LOGW(TAG, "Failed to send PONG");
                 }
+
+            } else {
+                /* Check if this is an OTA message */
+                esp_err_t ota_result = ota_handler_process_message(&rx_msg);
+                if (ota_result == ESP_OK) {
+                    /* OTA message was handled */
+                    ESP_LOGD(TAG, "Processed OTA message");
+                }
+                /* If not OTA message (ESP_ERR_INVALID_ARG), ignore silently */
             }
         }
     }
@@ -433,7 +501,7 @@ static void twai_transmit_task(void *arg) {
                 ESP_LOGW(TAG, "Failed to transmit ALS message");
             }
 
-#ifdef CONFIG_BME680_ENABLED
+#if defined(CONFIG_BME680_ENABLED) && BSEC_LIBRARY_AVAILABLE
             /* Transmit BME680 environmental data (if available) */
             if (latest[SENSOR_BME680].timestamp_ms > 0) {
                 can_format_bme_env_message(&latest[SENSOR_BME680], &tx_msg);
@@ -509,6 +577,16 @@ void app_main(void) {
                  g_node_id, (unsigned long)CAN_BASE_ADDR(g_node_id));
     }
 
+    /* Initialize OTA handler */
+    if (ota_handler_init(g_node_id) == ESP_OK) {
+        ESP_LOGI(TAG, "OTA handler initialized (CAN ID 0x%03lX)",
+                 (unsigned long)CAN_OTA_CMD_ID(g_node_id));
+        /* Mark firmware as valid to prevent rollback */
+        ota_handler_mark_valid();
+    } else {
+        ESP_LOGW(TAG, "OTA handler initialization failed");
+    }
+
     /* Create semaphores */
     done_sem = xSemaphoreCreateBinary();
     start_sem = xSemaphoreCreateBinary();
@@ -533,7 +611,7 @@ void app_main(void) {
     }
     ESP_LOGI(TAG, "Ambient light sensor (%s) initialized successfully", als_get_sensor_name());
 
-#ifdef CONFIG_BME680_ENABLED
+#if defined(CONFIG_BME680_ENABLED) && BSEC_LIBRARY_AVAILABLE
     /* Initialize BME680/BME688 environmental sensor */
     if (bme680_init() == ESP_OK) {
         ESP_LOGI(TAG, "BME680/688 (%s) initialized successfully (BSEC %s)",
@@ -575,7 +653,7 @@ void app_main(void) {
     /* Create tasks */
     xTaskCreate(sensor_poll_task, "SENSOR_POLL", 3072, NULL, SENSOR_POLL_TASK_PRIO, NULL);
 
-#ifdef CONFIG_BME680_ENABLED
+#if defined(CONFIG_BME680_ENABLED) && BSEC_LIBRARY_AVAILABLE
     xTaskCreate(bme680_sensor_task, "BME680_POLL", 10240, NULL, BME680_TASK_PRIO, NULL);
     ESP_LOGI(TAG, "BME680 sensor task created (10KB stack for BSEC)");
 #endif
@@ -587,9 +665,12 @@ void app_main(void) {
     ESP_LOGI(TAG, "All tasks created successfully");
     ESP_LOGI(TAG, "System ready - waiting for START command");
 
-    /* Main task: Periodic status logging */
+    /* Main task: Periodic status logging and OTA timeout check */
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(10000));  /* 10 second interval */
+
+        /* Check for OTA session timeout */
+        ota_handler_check_timeout();
 
         /* Read current lux for status */
         float current_lux;

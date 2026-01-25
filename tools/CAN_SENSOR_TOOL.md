@@ -236,11 +236,321 @@ Byte 1-7: Reserved (0x00)
 - [ ] Port functionality from existing calibrate_lux_sensor tool
 - [ ] Test: End-to-end calibration workflow
 
-### Phase 7: Firmware Update (Future)
-- [ ] Design firmware update protocol (separate discussion)
-- [ ] Implement ESP32 bootloader support
-- [ ] Implement `update` command
+### Phase 7: Firmware Update (A/B OTA over CAN)
+- [ ] Update ESP32 partition table for A/B OTA
+- [ ] Implement OTA CAN message handlers in ESP32 firmware
+- [ ] Implement `update` command in can-sensor-tool
 - [ ] Test: Full firmware update cycle
+
+---
+
+## A/B Firmware Update Design
+
+### Overview
+
+The A/B (dual-partition) firmware update mechanism allows safe over-the-air updates via CAN bus:
+- **Two OTA partitions:** ota_0 and ota_1 (plus factory fallback)
+- **Atomic updates:** New firmware written to inactive partition, then activated
+- **Rollback support:** If new firmware fails, boot back to previous version
+- **Per-node addressing:** Update specific nodes without affecting others
+
+### CAN ID Allocation for OTA
+
+OTA uses a separate ID range (0x700+) to avoid conflicts with sensor data:
+
+| Direction | Base ID | Per-Node Offset | Description |
+|-----------|---------|-----------------|-------------|
+| Tool → ESP32 | 0x700 | +0x10 per node | OTA Commands |
+| ESP32 → Tool | 0x708 | +0x10 per node | OTA Responses |
+
+**Node-specific IDs:**
+| Node ID | Command ID | Response ID |
+|---------|------------|-------------|
+| 0 | 0x700 | 0x708 |
+| 1 | 0x710 | 0x718 |
+| 2 | 0x720 | 0x728 |
+| 3 | 0x730 | 0x738 |
+| 4 | 0x740 | 0x748 |
+| 5 | 0x750 | 0x758 |
+
+### Custom Multi-Frame Protocol
+
+Since CAN frames are limited to 8 bytes, firmware data is sent in chunks with ACK-based reliability.
+
+**Frame Format (8 bytes):**
+```
+Byte 0:    Command/Response type
+Byte 1:    Sequence number (0-255, wraps)
+Byte 2-7:  Payload (6 bytes)
+```
+
+### OTA Commands (Tool → ESP32)
+
+| Type | Name | Payload | Description |
+|------|------|---------|-------------|
+| 0x01 | START_UPDATE | [Size:4][CRC32:2] | Begin update, total size + truncated CRC |
+| 0x02 | SEND_CHUNK | [Data:6] | Firmware data chunk (6 bytes) |
+| 0x03 | FINISH_UPDATE | [CRC32:4][Pad:2] | End update, verify full CRC32 |
+| 0x04 | ACTIVATE_FW | [Flags:1][Pad:5] | Set boot partition, optionally reboot |
+| 0x05 | GET_STATUS | [Pad:6] | Query current OTA status |
+| 0x06 | ABORT_UPDATE | [Pad:6] | Cancel in-progress update |
+
+### OTA Responses (ESP32 → Tool)
+
+| Type | Name | Payload | Description |
+|------|------|---------|-------------|
+| 0x81 | ACK | [SeqNum:1][Pad:5] | Chunk received OK |
+| 0x82 | NAK | [SeqNum:1][ErrCode:1][Pad:4] | Error, request retransmit |
+| 0x83 | STATUS | [State:1][Progress:2][Err:1][Pad:2] | Current OTA state |
+| 0x84 | READY | [MaxChunk:2][FreeSpace:4] | Ready to receive update |
+| 0x85 | COMPLETE | [Result:1][Pad:5] | Update finished (success/fail) |
+
+### Error Codes
+
+| Code | Name | Description |
+|------|------|-------------|
+| 0x00 | OK | No error |
+| 0x01 | ERR_BUSY | Update already in progress |
+| 0x02 | ERR_NO_SPACE | Firmware too large for partition |
+| 0x03 | ERR_SEQ | Sequence number mismatch |
+| 0x04 | ERR_CRC | CRC verification failed |
+| 0x05 | ERR_WRITE | Flash write error |
+| 0x06 | ERR_INVALID | Invalid command or state |
+| 0x07 | ERR_TIMEOUT | Operation timed out |
+| 0x08 | ERR_ABORTED | Update was aborted |
+
+### OTA State Machine (ESP32)
+
+```
+                    ┌─────────────┐
+                    │    IDLE     │
+                    └──────┬──────┘
+                           │ START_UPDATE
+                           ▼
+                    ┌─────────────┐
+         ┌─────────│  RECEIVING  │◄────────┐
+         │         └──────┬──────┘         │
+         │ ABORT          │ SEND_CHUNK     │ NAK (retry)
+         │                ▼                │
+         │         ┌─────────────┐         │
+         │         │  VERIFYING  │─────────┘
+         │         └──────┬──────┘
+         │                │ FINISH_UPDATE (CRC OK)
+         │                ▼
+         │         ┌─────────────┐
+         │         │   READY     │
+         │         └──────┬──────┘
+         │                │ ACTIVATE_FW
+         │                ▼
+         │         ┌─────────────┐
+         └────────►│    IDLE     │ (or REBOOTING)
+                   └─────────────┘
+```
+
+### Update Protocol Flow
+
+```
+Tool                                    ESP32
+ │                                        │
+ │──── START_UPDATE [size, crc16] ───────►│
+ │                                        │ (Erase partition)
+ │◄──── READY [max_chunk, free_space] ───│
+ │                                        │
+ │──── SEND_CHUNK [seq=0, data] ─────────►│
+ │◄──── ACK [seq=0] ─────────────────────│
+ │                                        │
+ │──── SEND_CHUNK [seq=1, data] ─────────►│
+ │◄──── ACK [seq=1] ─────────────────────│
+ │                                        │
+ │           ... repeat ...               │
+ │                                        │
+ │──── SEND_CHUNK [seq=N, data] ─────────►│
+ │◄──── ACK [seq=N] ─────────────────────│
+ │                                        │
+ │──── FINISH_UPDATE [crc32] ────────────►│
+ │                                        │ (Verify CRC)
+ │◄──── COMPLETE [result=OK] ────────────│
+ │                                        │
+ │──── ACTIVATE_FW [reboot=1] ───────────►│
+ │◄──── ACK ─────────────────────────────│
+ │                                        │ (Reboot)
+```
+
+### Retry and Timeout Handling
+
+- **Chunk ACK timeout:** 500ms (retry up to 3 times)
+- **Start/Finish timeout:** 5 seconds (partition erase takes time)
+- **Inter-chunk delay:** 10ms minimum (allow flash writes)
+- **Max retries per chunk:** 3 (then abort)
+- **Session timeout:** 5 minutes (auto-abort if idle)
+
+### ESP32 Partition Table
+
+Required partition layout for A/B OTA:
+
+```
+# Name,   Type, SubType,  Offset,   Size
+nvs,      data, nvs,      0x9000,   0x6000
+phy_init, data, phy,      0xf000,   0x1000
+otadata,  data, ota,      0x10000,  0x2000
+factory,  app,  factory,  0x20000,  0x100000
+ota_0,    app,  ota_0,    0x120000, 0x100000
+ota_1,    app,  ota_1,    0x220000, 0x100000
+```
+
+**Partition sizes:**
+- factory: 1 MB (fallback firmware)
+- ota_0: 1 MB (primary OTA slot)
+- ota_1: 1 MB (secondary OTA slot)
+- otadata: 8 KB (boot selection data)
+
+### ESP32 Firmware Changes
+
+**New files:**
+- `main/ota_handler.c/h` - OTA state machine and CAN handlers
+
+**Modified files:**
+- `main/main.c` - Add OTA task, register OTA CAN message handlers
+- `main/can_protocol.h` - Add OTA message ID definitions
+- `partitions.csv` - A/B partition layout
+- `CMakeLists.txt` - Include OTA handler
+
+**Key ESP-IDF APIs:**
+```c
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
+
+// Get next OTA partition to write
+esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
+
+// Begin OTA update
+esp_ota_handle_t ota_handle;
+esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &ota_handle);
+
+// Write firmware data
+esp_ota_write(ota_handle, chunk_data, chunk_size);
+
+// Finish and verify
+esp_ota_end(ota_handle);
+
+// Activate new firmware
+esp_ota_set_boot_partition(update_partition);
+
+// Reboot
+esp_restart();
+```
+
+### Tool-Side Implementation
+
+**New command:**
+```bash
+can-sensor-tool update <firmware.bin>           # Update node 0
+can-sensor-tool --node-id=2 update firmware.bin # Update node 2
+can-sensor-tool update --verify-only fw.bin     # Verify CRC without flashing
+```
+
+**Update command options:**
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--no-activate` | off | Write firmware but don't activate |
+| `--no-reboot` | off | Activate but don't reboot |
+| `--verify-only` | off | Just verify file CRC |
+| `--chunk-delay=<ms>` | 10 | Delay between chunks |
+| `--timeout=<sec>` | 300 | Total update timeout |
+
+**Progress display:**
+```
+$ can-sensor-tool --node-id=0 update firmware.bin
+Reading firmware file: firmware.bin (294912 bytes)
+Firmware CRC32: 0xA1B2C3D4
+Connecting to node 0...
+Starting update (partition: ota_0)...
+Erasing partition... done
+Uploading: [████████████████████░░░░] 85% (250880/294912) 48 KB/s
+Verifying CRC... OK
+Activating new firmware...
+Rebooting node...
+Update complete! Node 0 now running firmware v1.1.0
+```
+
+### Implementation Phases
+
+#### Phase 7a: ESP32 Partition Setup
+- [ ] Create `partitions.csv` with A/B layout
+- [ ] Update `sdkconfig` for custom partition table
+- [ ] Verify partition layout with `idf.py partition-table`
+- [ ] Test: Boot factory firmware, verify OTA partitions visible
+
+#### Phase 7b: ESP32 OTA Handler (Basic)
+- [ ] Create `ota_handler.c/h` with state machine
+- [ ] Add OTA CAN ID definitions to `can_protocol.h`
+- [ ] Implement START_UPDATE handler (erase partition)
+- [ ] Implement SEND_CHUNK handler (write to flash)
+- [ ] Implement FINISH_UPDATE handler (verify CRC)
+- [ ] Test: Receive firmware via CAN, verify written correctly
+
+#### Phase 7c: ESP32 OTA Handler (Activation)
+- [ ] Implement ACTIVATE_FW handler
+- [ ] Implement GET_STATUS handler
+- [ ] Implement ABORT_UPDATE handler
+- [ ] Add rollback detection (mark firmware valid after successful boot)
+- [ ] Test: Full update cycle with activation and reboot
+
+#### Phase 7d: Tool Update Command
+- [ ] Implement firmware file reading and CRC calculation
+- [ ] Implement START_UPDATE with size/CRC
+- [ ] Implement chunked transfer with ACK handling
+- [ ] Implement retry logic and timeout handling
+- [ ] Implement progress display
+- [ ] Test: Update node 0, verify new firmware runs
+
+#### Phase 7e: Multi-Node and Robustness
+- [ ] Test updates to different node IDs
+- [ ] Test recovery from interrupted update
+- [ ] Test rollback after bad firmware
+- [ ] Add --verify-only option
+- [ ] Add --no-activate and --no-reboot options
+- [ ] Test: Full integration with all options
+
+### OTA Testing Checklist
+
+#### Partition Setup
+- [ ] Partition table compiled without errors
+- [ ] `idf.py partition-table` shows correct layout
+- [ ] Factory firmware boots correctly
+- [ ] OTA partitions visible via `esp_partition_find()`
+
+#### Basic Update Flow
+- [ ] START_UPDATE erases target partition
+- [ ] SEND_CHUNK writes data correctly
+- [ ] Sequence numbers tracked properly
+- [ ] FINISH_UPDATE verifies CRC32
+- [ ] COMPLETE response sent with correct result
+
+#### Activation and Reboot
+- [ ] ACTIVATE_FW sets boot partition
+- [ ] ESP32 reboots to new firmware
+- [ ] New firmware version reported via `info` command
+- [ ] GET_STATUS returns correct state
+
+#### Error Handling
+- [ ] NAK sent for sequence mismatch
+- [ ] Retry after timeout works
+- [ ] ABORT_UPDATE cleans up properly
+- [ ] Large firmware (>512KB) handled correctly
+- [ ] Invalid CRC rejected
+
+#### Rollback Support
+- [ ] Bad firmware triggers rollback
+- [ ] Rollback to previous working firmware
+- [ ] Factory reset boots factory partition
+
+#### Tool Integration
+- [ ] Progress bar displays correctly
+- [ ] Timeout handling works
+- [ ] --verify-only checks CRC without flashing
+- [ ] --node-id targets correct node
+- [ ] Update speed: target ~10 KB/s minimum
 
 ## ESP32 Firmware Changes Summary
 

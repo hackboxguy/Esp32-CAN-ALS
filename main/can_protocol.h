@@ -84,6 +84,74 @@
 /* Status flags for INFO_RESPONSE */
 #define STATUS_FLAG_TX_ACTIVE   (1 << 0)  /* Currently transmitting */
 
+/* Partition type values for INFO_RESPONSE byte 7 (bits 0-2) */
+#define PARTITION_TYPE_FACTORY  0   /* Running from factory partition */
+#define PARTITION_TYPE_OTA_0    1   /* Running from ota_0 (App-A) */
+#define PARTITION_TYPE_OTA_1    2   /* Running from ota_1 (App-B) */
+#define PARTITION_TYPE_UNKNOWN  7   /* Unknown partition */
+
+/* OTA image state values for INFO_RESPONSE byte 7 (bits 4-6) */
+#define OTA_IMG_STATE_UNDEFINED     0   /* Not an OTA partition or unknown */
+#define OTA_IMG_STATE_NEW           1   /* First boot after OTA update */
+#define OTA_IMG_STATE_PENDING       2   /* Pending verification */
+#define OTA_IMG_STATE_VALID         3   /* Validated and confirmed */
+#define OTA_IMG_STATE_INVALID       4   /* Invalid / rollback triggered */
+#define OTA_IMG_STATE_ABORTED       5   /* Update aborted */
+
+/* Helper macros for partition info byte (byte 7 of INFO_RESPONSE) */
+#define PARTITION_INFO_PACK(type, state) (((state) << 4) | ((type) & 0x07))
+#define PARTITION_INFO_TYPE(byte)        ((byte) & 0x07)
+#define PARTITION_INFO_STATE(byte)       (((byte) >> 4) & 0x07)
+
+/* ======================== OTA Update Protocol ======================== */
+
+/* OTA uses separate CAN ID range (0x700+) to avoid conflicts with sensor data */
+#define CAN_OTA_BASE_ADDR       0x700
+#define CAN_OTA_ADDR_SPACING    0x10
+#define CAN_OTA_RESP_OFFSET     0x08  /* Response IDs are base + 8 */
+
+/* Calculate OTA command/response CAN IDs for a given node */
+#define CAN_OTA_CMD_ID(node_id)  (CAN_OTA_BASE_ADDR + ((node_id) * CAN_OTA_ADDR_SPACING))
+#define CAN_OTA_RESP_ID(node_id) (CAN_OTA_CMD_ID(node_id) + CAN_OTA_RESP_OFFSET)
+
+/* OTA Command Types (Tool -> ESP32) */
+#define OTA_CMD_START_UPDATE    0x01  /* Begin update: [Size:4][CRC16:2] */
+#define OTA_CMD_SEND_CHUNK      0x02  /* Send data: [Data:6] */
+#define OTA_CMD_FINISH_UPDATE   0x03  /* End update: [CRC32:4][Pad:2] */
+#define OTA_CMD_ACTIVATE_FW     0x04  /* Activate: [Flags:1][Pad:5] */
+#define OTA_CMD_GET_STATUS      0x05  /* Query status: [Pad:6] */
+#define OTA_CMD_ABORT_UPDATE    0x06  /* Abort: [Pad:6] */
+
+/* OTA Response Types (ESP32 -> Tool) */
+#define OTA_RESP_ACK            0x81  /* Chunk OK: [SeqNum:1][Pad:5] */
+#define OTA_RESP_NAK            0x82  /* Error: [SeqNum:1][ErrCode:1][Pad:4] */
+#define OTA_RESP_STATUS         0x83  /* Status: [State:1][Progress:2][Err:1][Pad:2] */
+#define OTA_RESP_READY          0x84  /* Ready: [MaxChunk:2][FreeSpace:4] */
+#define OTA_RESP_COMPLETE       0x85  /* Done: [Result:1][Pad:5] */
+
+/* OTA Error Codes */
+#define OTA_ERR_OK              0x00  /* No error */
+#define OTA_ERR_BUSY            0x01  /* Update already in progress */
+#define OTA_ERR_NO_SPACE        0x02  /* Firmware too large for partition */
+#define OTA_ERR_SEQ             0x03  /* Sequence number mismatch */
+#define OTA_ERR_CRC             0x04  /* CRC verification failed */
+#define OTA_ERR_WRITE           0x05  /* Flash write error */
+#define OTA_ERR_INVALID         0x06  /* Invalid command or state */
+#define OTA_ERR_TIMEOUT         0x07  /* Operation timed out */
+#define OTA_ERR_ABORTED         0x08  /* Update was aborted */
+
+/* OTA State Machine States */
+typedef enum {
+    OTA_STATE_IDLE = 0,       /* Waiting for START_UPDATE */
+    OTA_STATE_RECEIVING,      /* Receiving firmware chunks */
+    OTA_STATE_VERIFYING,      /* Verifying CRC after all chunks */
+    OTA_STATE_READY,          /* Ready to activate */
+    OTA_STATE_ACTIVATING,     /* Setting boot partition */
+} ota_state_t;
+
+/* OTA Activate Flags */
+#define OTA_ACTIVATE_FLAG_REBOOT    (1 << 0)  /* Reboot after activation */
+
 /* ======================== Message Formatting Functions ======================== */
 
 /**
@@ -194,17 +262,20 @@ void can_format_status_message(uint8_t active_sensors, uint8_t free_heap_kb,
  *   Byte 4:   Sensor flags (bit 0: ALS, bit 1: BME680, etc.)
  *   Byte 5:   ALS type (0=none, 1=VEML7700, 2=OPT4001)
  *   Byte 6:   Status flags (bit 0: transmitting)
- *   Byte 7:   Reserved
+ *   Byte 7:   Partition info (bits 0-2: type, bits 4-6: OTA state)
+ *             Type: 0=factory, 1=ota_0, 2=ota_1, 7=unknown
+ *             State: 0=undefined, 1=new, 2=pending, 3=valid, 4=invalid, 5=aborted
  *
  * @param[in] node_id Current node ID (0-5)
  * @param[in] sensor_flags Bitmask of detected sensors
  * @param[in] als_type ALS sensor type (ALS_TYPE_*)
  * @param[in] status_flags Current status flags
+ * @param[in] partition_info Partition type and OTA state (use PARTITION_INFO_PACK)
  * @param[out] msg CAN message to populate
  */
 void can_format_info_response(uint8_t node_id, uint8_t sensor_flags,
                               uint8_t als_type, uint8_t status_flags,
-                              twai_message_t *msg);
+                              uint8_t partition_info, twai_message_t *msg);
 
 /**
  * @brief Format PONG discovery response message

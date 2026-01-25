@@ -18,6 +18,8 @@
 #include <optional>
 #include <chrono>
 
+#include <fstream>
+
 #include <unistd.h>
 #include <net/if.h>
 #include <sys/ioctl.h>
@@ -91,6 +93,108 @@ inline MsgOffset extract_offset(uint32_t can_id) {
 } // namespace can_protocol
 
 /* ============================================================================
+ * OTA Protocol Constants
+ * ========================================================================== */
+
+namespace ota_protocol {
+
+// OTA CAN ID addressing (separate range from sensor data)
+constexpr uint32_t OTA_BASE_ADDR = 0x700;
+constexpr uint32_t OTA_ADDR_SPACING = 0x10;
+constexpr uint32_t OTA_RESP_OFFSET = 0x08;
+
+// Calculate OTA CAN IDs for a given node
+inline uint32_t cmd_id(int node_id) {
+    return OTA_BASE_ADDR + (node_id * OTA_ADDR_SPACING);
+}
+inline uint32_t resp_id(int node_id) {
+    return cmd_id(node_id) + OTA_RESP_OFFSET;
+}
+
+// OTA Command types (Tool -> ESP32)
+constexpr uint8_t CMD_START_UPDATE  = 0x01;
+constexpr uint8_t CMD_SEND_CHUNK    = 0x02;
+constexpr uint8_t CMD_FINISH_UPDATE = 0x03;
+constexpr uint8_t CMD_ACTIVATE_FW   = 0x04;
+constexpr uint8_t CMD_GET_STATUS    = 0x05;
+constexpr uint8_t CMD_ABORT_UPDATE  = 0x06;
+
+// OTA Response types (ESP32 -> Tool)
+constexpr uint8_t RESP_ACK      = 0x81;
+constexpr uint8_t RESP_NAK      = 0x82;
+constexpr uint8_t RESP_STATUS   = 0x83;
+constexpr uint8_t RESP_READY    = 0x84;
+constexpr uint8_t RESP_COMPLETE = 0x85;
+
+// OTA Error codes
+constexpr uint8_t ERR_OK        = 0x00;
+constexpr uint8_t ERR_BUSY      = 0x01;
+constexpr uint8_t ERR_NO_SPACE  = 0x02;
+constexpr uint8_t ERR_SEQ       = 0x03;
+constexpr uint8_t ERR_CRC       = 0x04;
+constexpr uint8_t ERR_WRITE     = 0x05;
+constexpr uint8_t ERR_INVALID   = 0x06;
+constexpr uint8_t ERR_TIMEOUT   = 0x07;
+constexpr uint8_t ERR_ABORTED   = 0x08;
+
+// Activate flags
+constexpr uint8_t ACTIVATE_FLAG_REBOOT = 0x01;
+
+// Protocol constants
+constexpr size_t CHUNK_SIZE = 6;          // Bytes per CAN frame payload
+constexpr int ACK_TIMEOUT_MS = 500;       // Timeout for ACK response
+constexpr int START_TIMEOUT_MS = 10000;   // Timeout for partition erase
+constexpr int FINISH_TIMEOUT_MS = 5000;   // Timeout for CRC verification
+constexpr int MAX_RETRIES = 3;            // Max retries per chunk
+constexpr int CHUNK_DELAY_MS = 10;        // Delay between chunks
+
+// Get error code name
+inline const char* error_name(uint8_t err) {
+    switch (err) {
+        case ERR_OK:       return "OK";
+        case ERR_BUSY:     return "BUSY";
+        case ERR_NO_SPACE: return "NO_SPACE";
+        case ERR_SEQ:      return "SEQUENCE_ERROR";
+        case ERR_CRC:      return "CRC_ERROR";
+        case ERR_WRITE:    return "WRITE_ERROR";
+        case ERR_INVALID:  return "INVALID";
+        case ERR_TIMEOUT:  return "TIMEOUT";
+        case ERR_ABORTED:  return "ABORTED";
+        default:           return "UNKNOWN";
+    }
+}
+
+} // namespace ota_protocol
+
+/* ============================================================================
+ * CRC32 Calculation (for OTA)
+ * ========================================================================== */
+
+static uint32_t crc32_table[256];
+static bool crc32_table_init = false;
+
+static void init_crc32_table() {
+    if (crc32_table_init) return;
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t crc = i;
+        for (int j = 0; j < 8; j++) {
+            crc = (crc >> 1) ^ ((crc & 1) ? 0xEDB88320 : 0);
+        }
+        crc32_table[i] = crc;
+    }
+    crc32_table_init = true;
+}
+
+static uint32_t calculate_crc32(const uint8_t* data, size_t len, uint32_t crc = 0) {
+    init_crc32_table();
+    crc = ~crc;
+    for (size_t i = 0; i < len; i++) {
+        crc = crc32_table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+    }
+    return ~crc;
+}
+
+/* ============================================================================
  * Output Format
  * ========================================================================== */
 
@@ -117,6 +221,7 @@ enum class Command {
     SET_NODE_ID,
     INFO,
     DISCOVER,
+    UPDATE,
 };
 
 /* ============================================================================
@@ -140,6 +245,13 @@ struct Config {
 
     // Set node ID option
     int new_node_id = -1;
+
+    // Update options
+    std::string firmware_file;
+    bool no_activate = false;
+    bool no_reboot = false;
+    bool verify_only = false;
+    int chunk_delay_ms = ota_protocol::CHUNK_DELAY_MS;
 };
 
 /* ============================================================================
@@ -340,11 +452,20 @@ void print_usage(const char* prog_name) {
     printf("    info                Query device information\n");
     printf("    discover            Scan bus for all sensor nodes\n");
     printf("\n");
+    printf("  Firmware Update:\n");
+    printf("    update <file>       Upload firmware via CAN\n");
+    printf("      --no-activate     Write firmware but don't activate\n");
+    printf("      --no-reboot       Activate but don't reboot\n");
+    printf("      --verify-only     Just verify file CRC, no upload\n");
+    printf("      --chunk-delay=<ms> Delay between chunks (default: %d)\n", ota_protocol::CHUNK_DELAY_MS);
+    printf("\n");
     printf("EXAMPLES:\n");
     printf("  %s monitor                        # Monitor node 0\n", prog_name);
     printf("  %s --node-id=1 reboot             # Reboot node 1\n", prog_name);
     printf("  %s --interface=can1 discover      # Discover nodes on can1\n", prog_name);
     printf("  %s monitor --format=json --quiet  # JSON output for scripting\n", prog_name);
+    printf("  %s update firmware.bin            # Update node 0 firmware\n", prog_name);
+    printf("  %s --node-id=2 update fw.bin      # Update node 2 firmware\n", prog_name);
     printf("\n");
 }
 
@@ -471,6 +592,35 @@ bool parse_args(int argc, char* argv[], Config& config) {
             continue;
         }
 
+        // --no-activate (update option)
+        if (strcmp(arg, "--no-activate") == 0) {
+            config.no_activate = true;
+            continue;
+        }
+
+        // --no-reboot (update option)
+        if (strcmp(arg, "--no-reboot") == 0) {
+            config.no_reboot = true;
+            continue;
+        }
+
+        // --verify-only (update option)
+        if (strcmp(arg, "--verify-only") == 0) {
+            config.verify_only = true;
+            continue;
+        }
+
+        // --chunk-delay=
+        if (auto val = parse_option(arg, "--chunk-delay")) {
+            auto delay = parse_int(val->c_str());
+            if (!delay || *delay < 0) {
+                fprintf(stderr, "Error: Invalid chunk-delay value: %s\n", val->c_str());
+                return false;
+            }
+            config.chunk_delay_ms = *delay;
+            continue;
+        }
+
         // Unknown option
         if (arg[0] == '-') {
             fprintf(stderr, "Error: Unknown option: %s\n", arg);
@@ -518,6 +668,13 @@ bool parse_args(int argc, char* argv[], Config& config) {
         config.command = Command::INFO;
     } else if (cmd == "discover") {
         config.command = Command::DISCOVER;
+    } else if (cmd == "update") {
+        config.command = Command::UPDATE;
+        if (positional.size() < 2) {
+            fprintf(stderr, "Error: update requires a firmware file argument\n");
+            return false;
+        }
+        config.firmware_file = positional[1];
     } else {
         fprintf(stderr, "Error: Unknown command: %s\n", cmd.c_str());
         return false;
@@ -956,7 +1113,21 @@ struct InfoResponse {
     uint8_t sensor_flags;
     uint8_t als_type;
     uint8_t status_flags;
+    uint8_t partition_info;  // bits 0-2: type, bits 4-6: OTA state
 };
+
+// Partition info constants (must match ESP32 can_protocol.h)
+constexpr uint8_t PARTITION_TYPE_FACTORY = 0;
+constexpr uint8_t PARTITION_TYPE_OTA_0   = 1;
+constexpr uint8_t PARTITION_TYPE_OTA_1   = 2;
+constexpr uint8_t PARTITION_TYPE_UNKNOWN = 7;
+
+constexpr uint8_t OTA_IMG_STATE_UNDEFINED = 0;
+constexpr uint8_t OTA_IMG_STATE_NEW       = 1;
+constexpr uint8_t OTA_IMG_STATE_PENDING   = 2;
+constexpr uint8_t OTA_IMG_STATE_VALID     = 3;
+constexpr uint8_t OTA_IMG_STATE_INVALID   = 4;
+constexpr uint8_t OTA_IMG_STATE_ABORTED   = 5;
 
 static bool parse_info_response(const struct can_frame& frame, InfoResponse& info) {
     if (frame.can_dlc < 7) return false;
@@ -968,6 +1139,7 @@ static bool parse_info_response(const struct can_frame& frame, InfoResponse& inf
     info.sensor_flags = frame.data[4];
     info.als_type = frame.data[5];
     info.status_flags = frame.data[6];
+    info.partition_info = (frame.can_dlc >= 8) ? frame.data[7] : 0;
 
     return true;
 }
@@ -981,6 +1153,29 @@ static const char* get_als_type_name(uint8_t als_type) {
     }
 }
 
+static const char* get_partition_type_name(uint8_t partition_info) {
+    uint8_t type = partition_info & 0x07;
+    switch (type) {
+        case PARTITION_TYPE_FACTORY: return "factory";
+        case PARTITION_TYPE_OTA_0:   return "ota_0";
+        case PARTITION_TYPE_OTA_1:   return "ota_1";
+        default:                     return "unknown";
+    }
+}
+
+static const char* get_ota_state_name(uint8_t partition_info) {
+    uint8_t state = (partition_info >> 4) & 0x07;
+    switch (state) {
+        case OTA_IMG_STATE_UNDEFINED: return "undefined";
+        case OTA_IMG_STATE_NEW:       return "new";
+        case OTA_IMG_STATE_PENDING:   return "pending";
+        case OTA_IMG_STATE_VALID:     return "valid";
+        case OTA_IMG_STATE_INVALID:   return "invalid";
+        case OTA_IMG_STATE_ABORTED:   return "aborted";
+        default:                      return "unknown";
+    }
+}
+
 static void print_info_response(const InfoResponse& info, OutputFormat format) {
     bool has_als = (info.sensor_flags & 0x01) != 0;
     bool has_bme = (info.sensor_flags & 0x02) != 0;
@@ -988,10 +1183,14 @@ static void print_info_response(const InfoResponse& info, OutputFormat format) {
     bool has_mq3 = (info.sensor_flags & 0x08) != 0;
     bool tx_active = (info.status_flags & 0x01) != 0;
 
+    const char* partition = get_partition_type_name(info.partition_info);
+    const char* ota_state = get_ota_state_name(info.partition_info);
+
     switch (format) {
         case OutputFormat::HUMAN:
             printf("Device Info (Node %d):\n", info.node_id);
             printf("  Firmware:    v%d.%d.%d\n", info.fw_major, info.fw_minor, info.fw_patch);
+            printf("  Partition:   %s (%s)\n", partition, ota_state);
             printf("  Base Addr:   0x%03X\n", can_protocol::BASE_ADDR_NODE_0 + info.node_id * can_protocol::NODE_ADDR_SPACING);
             printf("  Sensors:     ");
             if (has_als) printf("ALS(%s) ", get_als_type_name(info.als_type));
@@ -1005,9 +1204,11 @@ static void print_info_response(const InfoResponse& info, OutputFormat format) {
 
         case OutputFormat::JSON:
             printf("{\"type\":\"info\",\"node\":%d,\"firmware\":\"%d.%d.%d\","
+                   "\"partition\":\"%s\",\"ota_state\":\"%s\","
                    "\"base_addr\":\"0x%03X\",\"sensors\":{\"als\":%s,\"als_type\":\"%s\","
                    "\"bme680\":%s,\"ld2410\":%s,\"mq3\":%s},\"tx_active\":%s}\n",
                    info.node_id, info.fw_major, info.fw_minor, info.fw_patch,
+                   partition, ota_state,
                    can_protocol::BASE_ADDR_NODE_0 + info.node_id * can_protocol::NODE_ADDR_SPACING,
                    has_als ? "true" : "false", get_als_type_name(info.als_type),
                    has_bme ? "true" : "false",
@@ -1017,8 +1218,9 @@ static void print_info_response(const InfoResponse& info, OutputFormat format) {
             break;
 
         case OutputFormat::CSV:
-            printf("info,%d,%d.%d.%d,0x%03X,%d,%s,%d,%d,%d,%d\n",
+            printf("info,%d,%d.%d.%d,%s,%s,0x%03X,%d,%s,%d,%d,%d,%d\n",
                    info.node_id, info.fw_major, info.fw_minor, info.fw_patch,
+                   partition, ota_state,
                    can_protocol::BASE_ADDR_NODE_0 + info.node_id * can_protocol::NODE_ADDR_SPACING,
                    has_als ? 1 : 0, get_als_type_name(info.als_type),
                    has_bme ? 1 : 0, has_ld2410 ? 1 : 0, has_mq3 ? 1 : 0,
@@ -1170,6 +1372,325 @@ int cmd_discover(CanSocket& can, const Config& config) {
 }
 
 /* ============================================================================
+ * Update Command - OTA Firmware Update
+ * ========================================================================== */
+
+// Progress bar helper
+static void print_progress(uint32_t current, uint32_t total, uint32_t bytes_per_sec) {
+    const int bar_width = 30;
+    float progress = static_cast<float>(current) / total;
+    int filled = static_cast<int>(progress * bar_width);
+
+    fprintf(stderr, "\rUploading: [");
+    for (int i = 0; i < bar_width; i++) {
+        if (i < filled) fprintf(stderr, "=");
+        else if (i == filled) fprintf(stderr, ">");
+        else fprintf(stderr, " ");
+    }
+    fprintf(stderr, "] %3d%% (%u/%u) %.1f KB/s  ",
+            static_cast<int>(progress * 100), current, total,
+            bytes_per_sec / 1024.0f);
+    fflush(stderr);
+}
+
+int cmd_update(CanSocket& can, const Config& config) {
+    using namespace ota_protocol;
+
+    // Read firmware file
+    std::ifstream file(config.firmware_file, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        fprintf(stderr, "Error: Cannot open firmware file: %s\n", config.firmware_file.c_str());
+        return 1;
+    }
+
+    std::streamsize fw_size = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    std::vector<uint8_t> firmware(fw_size);
+    if (!file.read(reinterpret_cast<char*>(firmware.data()), fw_size)) {
+        fprintf(stderr, "Error: Failed to read firmware file\n");
+        return 1;
+    }
+    file.close();
+
+    info("Reading firmware file: %s (%u bytes)\n", config.firmware_file.c_str(), static_cast<uint32_t>(fw_size));
+
+    // Calculate CRC32
+    uint32_t crc32 = calculate_crc32(firmware.data(), firmware.size());
+    uint16_t crc16 = static_cast<uint16_t>(crc32 & 0xFFFF);  // Truncated for START_UPDATE
+
+    info("Firmware CRC32: 0x%08X\n", crc32);
+
+    // Verify-only mode
+    if (config.verify_only) {
+        printf("Firmware verification complete.\n");
+        printf("  File: %s\n", config.firmware_file.c_str());
+        printf("  Size: %u bytes\n", static_cast<uint32_t>(fw_size));
+        printf("  CRC32: 0x%08X\n", crc32);
+        return 0;
+    }
+
+    // CAN IDs for this node
+    uint32_t cmd_can_id = cmd_id(config.node_id);
+    uint32_t resp_can_id = resp_id(config.node_id);
+
+    info("Connecting to node %d (OTA CAN ID: 0x%03X)...\n", config.node_id, cmd_can_id);
+
+    // Send START_UPDATE: [Type:1][Seq:1][Size:4][CRC16:2]
+    {
+        uint8_t data[8] = {0};
+        data[0] = CMD_START_UPDATE;
+        data[1] = 0;  // Sequence (unused for START)
+        data[2] = (fw_size >> 0) & 0xFF;
+        data[3] = (fw_size >> 8) & 0xFF;
+        data[4] = (fw_size >> 16) & 0xFF;
+        data[5] = (fw_size >> 24) & 0xFF;
+        data[6] = crc16 & 0xFF;
+        data[7] = (crc16 >> 8) & 0xFF;
+
+        if (!can.send(cmd_can_id, data, 8)) {
+            fprintf(stderr, "Error: Failed to send START_UPDATE\n");
+            return 1;
+        }
+    }
+
+    info("Starting update (erasing partition)...\n");
+
+    // Wait for READY response
+    struct can_frame frame;
+    auto start_time = std::chrono::steady_clock::now();
+    bool got_ready = false;
+
+    while (!got_ready) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_time).count();
+
+        if (elapsed >= START_TIMEOUT_MS) {
+            fprintf(stderr, "Error: Timeout waiting for READY response\n");
+            return 1;
+        }
+
+        int remaining = START_TIMEOUT_MS - static_cast<int>(elapsed);
+        if (can.receive(frame, remaining)) {
+            if (frame.can_id == resp_can_id && frame.can_dlc >= 2) {
+                uint8_t resp_type = frame.data[0];
+
+                if (resp_type == RESP_READY) {
+                    uint16_t max_chunk = frame.data[2] | (frame.data[3] << 8);
+                    uint32_t free_space = frame.data[4] | (frame.data[5] << 8) |
+                                         (frame.data[6] << 16) | (frame.data[7] << 24);
+                    info("Partition ready (max_chunk=%u, free_space=%u)\n", max_chunk, free_space);
+                    got_ready = true;
+                } else if (resp_type == RESP_NAK) {
+                    uint8_t err = frame.data[3];
+                    fprintf(stderr, "Error: Device rejected START_UPDATE: %s\n", error_name(err));
+                    return 1;
+                }
+            }
+        }
+    }
+
+    // Send firmware chunks
+    info("Uploading firmware...\n");
+
+    uint32_t bytes_sent = 0;
+    uint8_t seq = 0;
+    int retries = 0;
+    auto upload_start = std::chrono::steady_clock::now();
+
+    while (bytes_sent < firmware.size()) {
+        // Calculate chunk size
+        size_t remaining_bytes = firmware.size() - bytes_sent;
+        size_t chunk_len = (remaining_bytes < CHUNK_SIZE) ? remaining_bytes : CHUNK_SIZE;
+
+        // Build SEND_CHUNK message
+        uint8_t data[8] = {0};
+        data[0] = CMD_SEND_CHUNK;
+        data[1] = seq;
+        std::memcpy(&data[2], &firmware[bytes_sent], chunk_len);
+
+        // Send chunk
+        if (!can.send(cmd_can_id, data, 8)) {
+            fprintf(stderr, "\nError: Failed to send chunk %d\n", seq);
+            return 1;
+        }
+
+        // Wait for ACK
+        bool got_ack = false;
+        auto chunk_start = std::chrono::steady_clock::now();
+
+        while (!got_ack) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - chunk_start).count();
+
+            if (elapsed >= ACK_TIMEOUT_MS) {
+                retries++;
+                if (retries > MAX_RETRIES) {
+                    fprintf(stderr, "\nError: Max retries exceeded for chunk %d\n", seq);
+                    return 1;
+                }
+                // Retry: resend the chunk
+                if (!can.send(cmd_can_id, data, 8)) {
+                    fprintf(stderr, "\nError: Failed to resend chunk %d\n", seq);
+                    return 1;
+                }
+                chunk_start = std::chrono::steady_clock::now();
+                continue;
+            }
+
+            int wait_ms = ACK_TIMEOUT_MS - static_cast<int>(elapsed);
+            if (can.receive(frame, wait_ms)) {
+                if (frame.can_id == resp_can_id && frame.can_dlc >= 2) {
+                    uint8_t resp_type = frame.data[0];
+                    uint8_t resp_seq = frame.data[2];
+
+                    if (resp_type == RESP_ACK && resp_seq == seq) {
+                        got_ack = true;
+                        bytes_sent += chunk_len;
+                        seq = (seq + 1) & 0xFF;
+                        retries = 0;
+
+                        // Update progress
+                        auto now = std::chrono::steady_clock::now();
+                        auto elapsed_sec = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            now - upload_start).count() / 1000.0f;
+                        uint32_t bytes_per_sec = (elapsed_sec > 0) ?
+                            static_cast<uint32_t>(bytes_sent / elapsed_sec) : 0;
+                        print_progress(bytes_sent, static_cast<uint32_t>(firmware.size()), bytes_per_sec);
+
+                    } else if (resp_type == RESP_NAK) {
+                        uint8_t err = frame.data[3];
+                        if (err == ERR_SEQ) {
+                            // Sequence mismatch - try to resync
+                            retries++;
+                            if (retries > MAX_RETRIES) {
+                                fprintf(stderr, "\nError: Sequence error, max retries exceeded\n");
+                                return 1;
+                            }
+                        } else {
+                            fprintf(stderr, "\nError: Device NAK'd chunk %d: %s\n", seq, error_name(err));
+                            return 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Inter-chunk delay
+        if (config.chunk_delay_ms > 0 && bytes_sent < firmware.size()) {
+            usleep(config.chunk_delay_ms * 1000);
+        }
+    }
+
+    fprintf(stderr, "\n");  // End progress line
+    info("Upload complete, verifying CRC...\n");
+
+    // Send FINISH_UPDATE with full CRC32
+    {
+        uint8_t data[8] = {0};
+        data[0] = CMD_FINISH_UPDATE;
+        data[1] = 0;  // Sequence (unused)
+        data[2] = (crc32 >> 0) & 0xFF;
+        data[3] = (crc32 >> 8) & 0xFF;
+        data[4] = (crc32 >> 16) & 0xFF;
+        data[5] = (crc32 >> 24) & 0xFF;
+
+        if (!can.send(cmd_can_id, data, 8)) {
+            fprintf(stderr, "Error: Failed to send FINISH_UPDATE\n");
+            return 1;
+        }
+    }
+
+    // Wait for COMPLETE response
+    start_time = std::chrono::steady_clock::now();
+    bool got_complete = false;
+    uint8_t result = 0xFF;
+
+    while (!got_complete) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_time).count();
+
+        if (elapsed >= FINISH_TIMEOUT_MS) {
+            fprintf(stderr, "Error: Timeout waiting for COMPLETE response\n");
+            return 1;
+        }
+
+        int remaining = FINISH_TIMEOUT_MS - static_cast<int>(elapsed);
+        if (can.receive(frame, remaining)) {
+            if (frame.can_id == resp_can_id && frame.can_dlc >= 2) {
+                uint8_t resp_type = frame.data[0];
+
+                if (resp_type == RESP_COMPLETE) {
+                    result = frame.data[2];
+                    got_complete = true;
+                } else if (resp_type == RESP_NAK) {
+                    uint8_t err = frame.data[3];
+                    fprintf(stderr, "Error: FINISH_UPDATE failed: %s\n", error_name(err));
+                    return 1;
+                }
+            }
+        }
+    }
+
+    if (result != ERR_OK) {
+        fprintf(stderr, "Error: Firmware verification failed: %s\n", error_name(result));
+        return 1;
+    }
+
+    info("Firmware verified successfully.\n");
+
+    // Skip activation if requested
+    if (config.no_activate) {
+        info("Firmware written but not activated (--no-activate).\n");
+        info("Use 'can-sensor-tool --node-id=%d update --activate' to activate later.\n", config.node_id);
+        return 0;
+    }
+
+    // Send ACTIVATE_FW
+    info("Activating new firmware...\n");
+    {
+        uint8_t flags = config.no_reboot ? 0 : ACTIVATE_FLAG_REBOOT;
+        uint8_t data[8] = {0};
+        data[0] = CMD_ACTIVATE_FW;
+        data[1] = 0;  // Sequence (unused)
+        data[2] = flags;
+
+        if (!can.send(cmd_can_id, data, 8)) {
+            fprintf(stderr, "Error: Failed to send ACTIVATE_FW\n");
+            return 1;
+        }
+    }
+
+    // Wait for ACK
+    start_time = std::chrono::steady_clock::now();
+    while (true) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_time).count();
+
+        if (elapsed >= ACK_TIMEOUT_MS) {
+            // Node may have rebooted already, which is OK
+            break;
+        }
+
+        int remaining = ACK_TIMEOUT_MS - static_cast<int>(elapsed);
+        if (can.receive(frame, remaining)) {
+            if (frame.can_id == resp_can_id && frame.data[0] == RESP_ACK) {
+                break;
+            }
+        }
+    }
+
+    if (config.no_reboot) {
+        info("Firmware activated. Use 'can-sensor-tool --node-id=%d reboot' to boot new firmware.\n",
+             config.node_id);
+    } else {
+        info("Update complete! Node %d is rebooting to new firmware.\n", config.node_id);
+    }
+
+    return 0;
+}
+
+/* ============================================================================
  * Main
  * ========================================================================== */
 
@@ -1237,6 +1758,9 @@ int main(int argc, char* argv[]) {
             break;
         case Command::DISCOVER:
             result = cmd_discover(can, config);
+            break;
+        case Command::UPDATE:
+            result = cmd_update(can, config);
             break;
         default:
             fprintf(stderr, "Error: No command specified\n");

@@ -6,7 +6,8 @@
 
 #include "bme680_bsec.h"
 
-#ifdef CONFIG_BME680_ENABLED
+/* Only compile if both CONFIG_BME680_ENABLED and BSEC library are available */
+#if defined(CONFIG_BME680_ENABLED) && BSEC_LIBRARY_AVAILABLE
 
 #include <string.h>
 #include <freertos/FreeRTOS.h>

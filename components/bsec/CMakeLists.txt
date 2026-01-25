@@ -68,7 +68,7 @@ else()
         INCLUDE_DIRS ""
     )
 
-    # Define that BSEC is NOT available
-    target_compile_definitions(${COMPONENT_LIB} PUBLIC BSEC_LIBRARY_AVAILABLE=0)
+    # Define that BSEC is NOT available (use INTERFACE for header-only/empty libs)
+    target_compile_definitions(${COMPONENT_LIB} INTERFACE BSEC_LIBRARY_AVAILABLE=0)
 
 endif()

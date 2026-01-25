@@ -176,7 +176,7 @@ void can_format_status_message(uint8_t active_sensors, uint8_t free_heap_kb,
 
 void can_format_info_response(uint8_t node_id, uint8_t sensor_flags,
                               uint8_t als_type, uint8_t status_flags,
-                              twai_message_t *msg) {
+                              uint8_t partition_info, twai_message_t *msg) {
     memset(msg, 0, sizeof(twai_message_t));
 
     msg->identifier = CAN_MSG_ID(node_id, CAN_MSG_OFFSET_INFO_RESP);
@@ -190,7 +190,7 @@ void can_format_info_response(uint8_t node_id, uint8_t sensor_flags,
     msg->data[4] = sensor_flags;
     msg->data[5] = als_type;
     msg->data[6] = status_flags;
-    msg->data[7] = 0x00;  /* Reserved */
+    msg->data[7] = partition_info;  /* Partition type (bits 0-2) + OTA state (bits 4-6) */
 }
 
 void can_format_pong_response(uint8_t node_id, twai_message_t *msg) {

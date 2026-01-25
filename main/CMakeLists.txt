@@ -6,5 +6,6 @@ idf_component_register(SRCS "main.c"
                             "als_driver.c"
                             "can_protocol.c"
                             "bme680_bsec.c"
+                            "ota_handler.c"
                       INCLUDE_DIRS "."
-                      REQUIRES driver esp_timer nvs_flash bsec)
+                      REQUIRES driver esp_timer nvs_flash bsec app_update esp_partition)
