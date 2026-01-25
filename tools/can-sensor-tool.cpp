@@ -142,11 +142,12 @@ constexpr uint8_t ACTIVATE_FLAG_REBOOT = 0x01;
 
 // Protocol constants
 constexpr size_t CHUNK_SIZE = 6;          // Bytes per CAN frame payload
-constexpr int ACK_TIMEOUT_MS = 500;       // Timeout for ACK response
+constexpr int ACK_TIMEOUT_MS = 150;       // Timeout for ACK response (reduced from 500ms)
+constexpr int ACK_TIMEOUT_INITIAL_MS = 50;// Initial timeout for exponential backoff
 constexpr int START_TIMEOUT_MS = 10000;   // Timeout for partition erase
 constexpr int FINISH_TIMEOUT_MS = 5000;   // Timeout for CRC verification
 constexpr int MAX_RETRIES = 3;            // Max retries per chunk
-constexpr int CHUNK_DELAY_MS = 10;        // Delay between chunks
+constexpr int CHUNK_DELAY_MS = 0;         // Delay between chunks (0 = fastest)
 
 // Get error code name
 inline const char* error_name(uint8_t err) {
@@ -1515,21 +1516,27 @@ int cmd_update(CanSocket& can, const Config& config) {
             return 1;
         }
 
-        // Wait for ACK
+        // Wait for ACK with exponential backoff on retries
+        // First attempt: 50ms, retry 1: 100ms, retry 2: 150ms, retry 3: 150ms (capped)
         bool got_ack = false;
+        int current_timeout = ACK_TIMEOUT_INITIAL_MS * (1 << retries);  // 50, 100, 200, 400...
+        if (current_timeout > ACK_TIMEOUT_MS) current_timeout = ACK_TIMEOUT_MS;
         auto chunk_start = std::chrono::steady_clock::now();
 
         while (!got_ack) {
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - chunk_start).count();
 
-            if (elapsed >= ACK_TIMEOUT_MS) {
+            if (elapsed >= current_timeout) {
                 retries++;
                 if (retries > MAX_RETRIES) {
                     fprintf(stderr, "\nError: Max retries exceeded for chunk %d\n", seq);
                     return 1;
                 }
-                // Retry: resend the chunk
+                // Retry with increased timeout (exponential backoff)
+                current_timeout = ACK_TIMEOUT_INITIAL_MS * (1 << retries);
+                if (current_timeout > ACK_TIMEOUT_MS) current_timeout = ACK_TIMEOUT_MS;
+
                 if (!can.send(cmd_can_id, data, 8)) {
                     fprintf(stderr, "\nError: Failed to resend chunk %d\n", seq);
                     return 1;
@@ -1538,7 +1545,7 @@ int cmd_update(CanSocket& can, const Config& config) {
                 continue;
             }
 
-            int wait_ms = ACK_TIMEOUT_MS - static_cast<int>(elapsed);
+            int wait_ms = current_timeout - static_cast<int>(elapsed);
             if (can.receive(frame, wait_ms)) {
                 if (frame.can_id == resp_can_id && frame.can_dlc >= 2) {
                     uint8_t resp_type = frame.data[0];

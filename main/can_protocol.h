@@ -7,10 +7,19 @@
 #include "sensor_common.h"
 
 /* ======================== Firmware Version ======================== */
+/* Override via: idf.py build -DCMAKE_C_FLAGS="-DFIRMWARE_VERSION_PATCH=1" */
 
+#ifndef FIRMWARE_VERSION_MAJOR
 #define FIRMWARE_VERSION_MAJOR  1
+#endif
+
+#ifndef FIRMWARE_VERSION_MINOR
 #define FIRMWARE_VERSION_MINOR  0
+#endif
+
+#ifndef FIRMWARE_VERSION_PATCH
 #define FIRMWARE_VERSION_PATCH  0
+#endif
 
 /* ======================== Node ID Addressing ======================== */
 
