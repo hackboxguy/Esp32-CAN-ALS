@@ -1182,9 +1182,11 @@ static const char* get_ota_state_name(uint8_t partition_info) {
 static void print_info_response(const InfoResponse& info, OutputFormat format) {
     bool has_als = (info.sensor_flags & 0x01) != 0;
     bool has_bme = (info.sensor_flags & 0x02) != 0;
+    bool is_bme688 = (info.sensor_flags & 0x10) != 0;  // Bit 4 indicates BME688 variant
     bool has_ld2410 = (info.sensor_flags & 0x04) != 0;
     bool has_mq3 = (info.sensor_flags & 0x08) != 0;
     bool tx_active = (info.status_flags & 0x01) != 0;
+    const char* bme_name = is_bme688 ? "BME688" : "BME680";
 
     const char* partition = get_partition_type_name(info.partition_info);
     const char* ota_state = get_ota_state_name(info.partition_info);
@@ -1197,7 +1199,7 @@ static void print_info_response(const InfoResponse& info, OutputFormat format) {
             printf("  Base Addr:   0x%03X\n", can_protocol::BASE_ADDR_NODE_0 + info.node_id * can_protocol::NODE_ADDR_SPACING);
             printf("  Sensors:     ");
             if (has_als) printf("ALS(%s) ", get_als_type_name(info.als_type));
-            if (has_bme) printf("BME680 ");
+            if (has_bme) printf("%s ", bme_name);
             if (has_ld2410) printf("LD2410 ");
             if (has_mq3) printf("MQ-3 ");
             if (!has_als && !has_bme && !has_ld2410 && !has_mq3) printf("(none)");
@@ -1209,12 +1211,12 @@ static void print_info_response(const InfoResponse& info, OutputFormat format) {
             printf("{\"type\":\"info\",\"node\":%d,\"firmware\":\"%d.%d.%d\","
                    "\"partition\":\"%s\",\"ota_state\":\"%s\","
                    "\"base_addr\":\"0x%03X\",\"sensors\":{\"als\":%s,\"als_type\":\"%s\","
-                   "\"bme680\":%s,\"ld2410\":%s,\"mq3\":%s},\"tx_active\":%s}\n",
+                   "\"bme\":%s,\"bme_type\":\"%s\",\"ld2410\":%s,\"mq3\":%s},\"tx_active\":%s}\n",
                    info.node_id, info.fw_major, info.fw_minor, info.fw_patch,
                    partition, ota_state,
                    can_protocol::BASE_ADDR_NODE_0 + info.node_id * can_protocol::NODE_ADDR_SPACING,
                    has_als ? "true" : "false", get_als_type_name(info.als_type),
-                   has_bme ? "true" : "false",
+                   has_bme ? "true" : "false", has_bme ? bme_name : "None",
                    has_ld2410 ? "true" : "false",
                    has_mq3 ? "true" : "false",
                    tx_active ? "true" : "false");

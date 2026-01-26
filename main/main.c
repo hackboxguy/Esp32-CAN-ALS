@@ -238,6 +238,9 @@ static uint8_t get_sensor_flags(void) {
 
 #if defined(CONFIG_BME680_ENABLED) && BSEC_LIBRARY_AVAILABLE
     flags |= SENSOR_FLAG_BME680;
+    if (bme680_is_bme688()) {
+        flags |= SENSOR_FLAG_BME688;
+    }
 #endif
 
     return flags;
@@ -251,6 +254,7 @@ static uint8_t get_als_type(void) {
     /* Check sensor name to determine type */
     if (strstr(name, "VEML7700") != NULL) return ALS_TYPE_VEML7700;
     if (strstr(name, "OPT4001") != NULL) return ALS_TYPE_OPT4001;
+    if (strstr(name, "OPT3001") != NULL) return ALS_TYPE_OPT3001;
 
     return ALS_TYPE_NONE;
 }
