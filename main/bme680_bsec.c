@@ -31,6 +31,7 @@
 
 /* BSEC config (from components/bsec/config) */
 #include "bsec_iaq.h"
+#include "bsec_iaq_bme688.h"
 
 static const char *TAG = "BME68x";
 
@@ -300,18 +301,37 @@ static esp_err_t bsec_init_library(void) {
              version.major, version.minor, version.major_bugfix, version.minor_bugfix);
 
     /* Load BSEC configuration blob for LP mode (3 seconds)
-     * Using bme680_iaq_33v_3s_4d (3.3V, 3-second LP mode, 4-day calibration) */
+     * Auto-select config based on sensor variant:
+     * - BME680: bme680_iaq_33v_3s_4d
+     * - BME688: bme688_iaq_33v_3s_4d (optimized for BME688)
+     */
     ESP_LOGI(TAG, "BSEC_OUTPUT_INCLUDED: 0x%X, LP_RATE: %.5f, DISABLED: %.0f",
              BSEC_OUTPUT_INCLUDED, BSEC_SAMPLE_RATE_LP, BSEC_SAMPLE_RATE_DISABLED);
 
     static uint8_t work_buffer[BSEC_MAX_WORKBUFFER_SIZE];
-    bsec_status = bsec_set_configuration(bsec_config_iaq, sizeof(bsec_config_iaq),
+    const uint8_t *config_blob;
+    size_t config_size;
+    const char *config_name;
+
+    if (g_bme68x.is_bme688) {
+        /* BME688 detected - use BME688-specific config */
+        config_blob = bsec_config_iaq_bme688;
+        config_size = sizeof(bsec_config_iaq_bme688);
+        config_name = "BME688";
+    } else {
+        /* BME680 detected - use BME680 config */
+        config_blob = bsec_config_iaq;
+        config_size = sizeof(bsec_config_iaq);
+        config_name = "BME680";
+    }
+
+    bsec_status = bsec_set_configuration(config_blob, config_size,
                                           work_buffer, sizeof(work_buffer));
     if (bsec_status != BSEC_OK) {
         ESP_LOGE(TAG, "Failed to set BSEC configuration (error %d)", bsec_status);
         return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "BSEC configuration loaded (BME680, 3.3V, LP/3s, 4-day)");
+    ESP_LOGI(TAG, "BSEC configuration loaded (%s, 3.3V, LP/3s, 4-day)", config_name);
 
     /* Configure requested virtual sensors for LP mode (3 seconds)
      * IAQ config may not support RAW outputs - try HEAT_COMPENSATED instead

@@ -23,6 +23,7 @@ if(EXISTS "${BSEC_LIB_PATH}" AND
     set(COMPONENT_SRCS
         "src/bme68x.c"
         "config/bsec_iaq.c"
+        "config/bsec_iaq_bme688.c"
     )
 
     # Add include directories
