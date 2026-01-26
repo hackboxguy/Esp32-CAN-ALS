@@ -3,6 +3,7 @@
 #include "als_driver.h"
 #include "veml7700_driver.h"
 #include "opt4001_driver.h"
+#include "opt3001_driver.h"
 #include <driver/i2c.h>
 #include <esp_log.h>
 
@@ -83,7 +84,36 @@ esp_err_t als_init(void) {
 
     ESP_LOGI(TAG, "Auto-detecting ambient light sensor...");
 
-    /* Try VEML7700 first (address 0x10) */
+    /* Priority order: OPT3001 > OPT4001 > VEML7700
+     * OPT3001/OPT4001 both use address 0x44, distinguished by Device ID:
+     * - OPT3001: Device ID 0x3001 at register 0x7F
+     * - OPT4001: Device ID 0x0121 at register 0x11
+     */
+
+    /* Try OPT3001/OPT4001 first (address 0x44) - higher priority */
+    if (i2c_probe_device(0x44) == ESP_OK) {
+        ESP_LOGI(TAG, "Device detected at address 0x44, identifying...");
+
+        /* Try OPT3001 first (highest priority) */
+        esp_err_t ret = opt3001_init();
+        if (ret == ESP_OK) {
+            detected_sensor = ALS_TYPE_OPT3001;
+            ESP_LOGI(TAG, "Using OPT3001 (0-83K lux, factory calibrated)");
+            return ESP_OK;
+        }
+
+        /* If OPT3001 init failed (wrong device ID), try OPT4001 */
+        ret = opt4001_init();
+        if (ret == ESP_OK) {
+            detected_sensor = ALS_TYPE_OPT4001;
+            ESP_LOGI(TAG, "Using OPT4001 (0-2.2M lux, factory calibrated)");
+            return ESP_OK;
+        }
+
+        ESP_LOGW(TAG, "Device at 0x44 is neither OPT3001 nor OPT4001");
+    }
+
+    /* Fall back to VEML7700 (address 0x10) - lowest priority */
     if (i2c_probe_device(0x10) == ESP_OK) {
         ESP_LOGI(TAG, "VEML7700 detected at address 0x10");
         esp_err_t ret = veml7700_init();
@@ -96,22 +126,9 @@ esp_err_t als_init(void) {
         }
     }
 
-    /* Try OPT4001 (address 0x44) */
-    if (i2c_probe_device(0x44) == ESP_OK) {
-        ESP_LOGI(TAG, "OPT4001 detected at address 0x44");
-        esp_err_t ret = opt4001_init();
-        if (ret == ESP_OK) {
-            detected_sensor = ALS_TYPE_OPT4001;
-            ESP_LOGI(TAG, "Using OPT4001 (0-2.2M lux, factory calibrated)");
-            return ESP_OK;
-        } else {
-            ESP_LOGE(TAG, "OPT4001 initialization failed");
-        }
-    }
-
     /* No sensor found */
     ESP_LOGE(TAG, "No ambient light sensor detected!");
-    ESP_LOGE(TAG, "Checked: 0x10 (VEML7700), 0x44 (OPT4001)");
+    ESP_LOGE(TAG, "Checked: 0x44 (OPT3001/OPT4001), 0x10 (VEML7700)");
     detected_sensor = ALS_TYPE_NONE;
     return ESP_ERR_NOT_FOUND;
 }
@@ -135,6 +152,10 @@ esp_err_t als_read_lux(float *lux) {
             /* OPT4001: Factory calibrated, no correction needed */
             return opt4001_read_lux(lux);
 
+        case ALS_TYPE_OPT3001:
+            /* OPT3001: Factory calibrated, no correction needed */
+            return opt3001_read_lux(lux);
+
         default:
             return ESP_ERR_INVALID_STATE;
     }
@@ -155,8 +176,13 @@ uint8_t als_get_config_idx(void) {
              * This allows CAN clients to identify sensor type:
              * - 0-20: VEML7700
              * - 100-111: OPT4001
+             * - 200-211: OPT3001
              */
             return 100 + opt4001_get_range_index();
+
+        case ALS_TYPE_OPT3001:
+            /* OPT3001: Auto-range index 0-11, offset by 200 to distinguish from others */
+            return 200 + opt3001_get_range_index();
 
         default:
             return 0;
@@ -171,6 +197,9 @@ const char* als_get_status_string(void) {
         case ALS_TYPE_OPT4001:
             return opt4001_get_status_string();
 
+        case ALS_TYPE_OPT3001:
+            return opt3001_get_status_string();
+
         default:
             return "No Sensor";
     }
@@ -183,6 +212,9 @@ const char* als_get_sensor_name(void) {
 
         case ALS_TYPE_OPT4001:
             return "OPT4001";
+
+        case ALS_TYPE_OPT3001:
+            return "OPT3001";
 
         default:
             return "None";

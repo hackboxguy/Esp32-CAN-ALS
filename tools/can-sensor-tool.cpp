@@ -859,6 +859,7 @@ static bool parse_aiq_message(const struct can_frame& frame, AiqData& data) {
 static const char* get_sensor_type(uint8_t config_idx) {
     if (config_idx <= 20) return "VEML7700";
     if (config_idx >= 100 && config_idx <= 111) return "OPT4001";
+    if (config_idx >= 200 && config_idx <= 211) return "OPT3001";
     return "Unknown";
 }
 
@@ -1150,6 +1151,7 @@ static const char* get_als_type_name(uint8_t als_type) {
         case 0: return "None";
         case 1: return "VEML7700";
         case 2: return "OPT4001";
+        case 3: return "OPT3001";
         default: return "Unknown";
     }
 }

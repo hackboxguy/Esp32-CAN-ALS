@@ -1,4 +1,4 @@
-/* als_driver.h - Unified Ambient Light Sensor Driver (VEML7700 or OPT4001) */
+/* als_driver.h - Unified Ambient Light Sensor Driver (VEML7700, OPT4001, or OPT3001) */
 
 #ifndef ALS_DRIVER_H
 #define ALS_DRIVER_H
@@ -12,7 +12,8 @@
 typedef enum {
     ALS_TYPE_NONE = 0,
     ALS_TYPE_VEML7700,
-    ALS_TYPE_OPT4001
+    ALS_TYPE_OPT4001,
+    ALS_TYPE_OPT3001
 } als_type_t;
 
 /**
@@ -20,7 +21,7 @@ typedef enum {
  *
  * Auto-detects which sensor is present on the I2C bus:
  * - Probes 0x10 for VEML7700
- * - Probes 0x44 for OPT4001
+ * - Probes 0x44 for OPT4001 or OPT3001 (distinguished by Device ID)
  * - Initializes whichever sensor is found
  *
  * @return ESP_OK on success, ESP_ERR_NOT_FOUND if no sensor detected
@@ -42,7 +43,7 @@ esp_err_t als_read_lux(float *lux);
 /**
  * @brief Get detected sensor type
  *
- * @return ALS_TYPE_VEML7700, ALS_TYPE_OPT4001, or ALS_TYPE_NONE
+ * @return ALS_TYPE_VEML7700, ALS_TYPE_OPT4001, ALS_TYPE_OPT3001, or ALS_TYPE_NONE
  */
 als_type_t als_get_sensor_type(void);
 
@@ -52,6 +53,7 @@ als_type_t als_get_sensor_type(void);
  * Returns current operating configuration:
  * - VEML7700: 0-20 (configuration index)
  * - OPT4001: 100-111 (auto-range index + 100 offset)
+ * - OPT3001: 200-211 (auto-range index + 200 offset)
  *
  * This allows CAN clients to distinguish sensor type from config field.
  *
@@ -69,7 +71,7 @@ const char* als_get_status_string(void);
 /**
  * @brief Get sensor type name
  *
- * @return "VEML7700", "OPT4001", or "None"
+ * @return "VEML7700", "OPT4001", "OPT3001", or "None"
  */
 const char* als_get_sensor_name(void);
 

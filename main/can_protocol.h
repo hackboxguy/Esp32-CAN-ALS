@@ -89,6 +89,7 @@
 #define ALS_TYPE_NONE           0
 #define ALS_TYPE_VEML7700       1
 #define ALS_TYPE_OPT4001        2
+#define ALS_TYPE_OPT3001        3
 
 /* Status flags for INFO_RESPONSE */
 #define STATUS_FLAG_TX_ACTIVE   (1 << 0)  /* Currently transmitting */
@@ -269,7 +270,7 @@ void can_format_status_message(uint8_t active_sensors, uint8_t free_heap_kb,
  *   Byte 2:   Firmware version minor
  *   Byte 3:   Firmware version patch
  *   Byte 4:   Sensor flags (bit 0: ALS, bit 1: BME680, etc.)
- *   Byte 5:   ALS type (0=none, 1=VEML7700, 2=OPT4001)
+ *   Byte 5:   ALS type (0=none, 1=VEML7700, 2=OPT4001, 3=OPT3001)
  *   Byte 6:   Status flags (bit 0: transmitting)
  *   Byte 7:   Partition info (bits 0-2: type, bits 4-6: OTA state)
  *             Type: 0=factory, 1=ota_0, 2=ota_1, 7=unknown
