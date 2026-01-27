@@ -86,11 +86,11 @@
 #define SENSOR_FLAG_MQ3         (1 << 3)  /* MQ-3 gas sensor */
 #define SENSOR_FLAG_BME688      (1 << 4)  /* BME688 variant (if BME680 flag also set) */
 
-/* ALS type values for INFO_RESPONSE */
-#define ALS_TYPE_NONE           0
-#define ALS_TYPE_VEML7700       1
-#define ALS_TYPE_OPT4001        2
-#define ALS_TYPE_OPT3001        3
+/* ALS type values for INFO_RESPONSE (prefixed to avoid enum conflict) */
+#define CAN_ALS_TYPE_NONE           0
+#define CAN_ALS_TYPE_VEML7700       1
+#define CAN_ALS_TYPE_OPT4001        2
+#define CAN_ALS_TYPE_OPT3001        3
 
 /* Status flags for INFO_RESPONSE */
 #define STATUS_FLAG_TX_ACTIVE   (1 << 0)  /* Currently transmitting */

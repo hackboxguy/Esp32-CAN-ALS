@@ -1,4 +1,9 @@
-/* main.c - ESP32-C3/C6 Multi-Sensor CAN Node (Refactored) */
+/* main.c - ESP32-C3/C6 Multi-Sensor CAN Node
+ *
+ * Supports two firmware types:
+ *   FACTORY - Minimal firmware with CAN + OTA only (silent on CAN bus)
+ *   MAIN    - Full-featured firmware with all sensors
+ */
 
 #include <stdio.h>
 #include <string.h>
@@ -13,17 +18,22 @@
 #include <nvs_flash.h>
 #include <driver/twai.h>
 
+#include "firmware_config.h"
+#include "can_protocol.h"
+
+/* OTA firmware update support (both FACTORY and MAIN) */
+#include "ota_handler.h"
+
+/* Sensor includes (MAIN firmware only) */
+#if IS_MAIN_FIRMWARE
 #include "sensor_common.h"
 #include "als_driver.h"
-#include "can_protocol.h"
 
 /* Conditional BME680 support */
 #if defined(CONFIG_BME680_ENABLED) && BSEC_LIBRARY_AVAILABLE
 #include "bme680_bsec.h"
 #endif
-
-/* OTA firmware update support */
-#include "ota_handler.h"
+#endif /* IS_MAIN_FIRMWARE */
 
 /* ======================== Configuration ======================== */
 
@@ -56,11 +66,14 @@ static const char *TAG = "MULTI_SENSOR";
 
 static SemaphoreHandle_t done_sem;
 static SemaphoreHandle_t start_sem;
+
+#if IS_MAIN_FIRMWARE
 static QueueHandle_t sensor_queue;
+static bool g_tx_active = false;  /* Track if transmission is active */
+#endif
 
 /* Node ID configuration (0-5, loaded from NVS) */
 static uint8_t g_node_id = 0;
-static bool g_tx_active = false;  /* Track if transmission is active */
 
 /* ======================== NVS Node ID Functions ======================== */
 
@@ -117,8 +130,9 @@ static esp_err_t save_node_id_to_nvs(uint8_t node_id) {
     return err;
 }
 
-/* ======================== Sensor Poll Task ======================== */
+/* ======================== Sensor Poll Task (MAIN only) ======================== */
 
+#if IS_MAIN_FIRMWARE
 static void sensor_poll_task(void *arg) {
     sensor_data_t msg;
     TickType_t xLastWakeTime = xTaskGetTickCount();
@@ -224,11 +238,13 @@ static void bme680_sensor_task(void *arg) {
     }
 }
 #endif /* CONFIG_BME680_ENABLED */
+#endif /* IS_MAIN_FIRMWARE */
 
 /* ======================== CAN Tasks ======================== */
 
 /* Helper function to get sensor flags */
 static uint8_t get_sensor_flags(void) {
+#if IS_MAIN_FIRMWARE
     uint8_t flags = 0;
 
     /* Check ALS sensor */
@@ -244,19 +260,24 @@ static uint8_t get_sensor_flags(void) {
 #endif
 
     return flags;
+#else
+    /* FACTORY firmware: No sensors */
+    return 0;
+#endif
 }
 
-/* Helper function to get ALS type */
+/* Helper function to get ALS type for CAN INFO_RESPONSE */
 static uint8_t get_als_type(void) {
+#if IS_MAIN_FIRMWARE
     const char *name = als_get_sensor_name();
-    if (name == NULL) return ALS_TYPE_NONE;
+    if (name == NULL) return CAN_ALS_TYPE_NONE;
 
     /* Check sensor name to determine type */
-    if (strstr(name, "VEML7700") != NULL) return ALS_TYPE_VEML7700;
-    if (strstr(name, "OPT4001") != NULL) return ALS_TYPE_OPT4001;
-    if (strstr(name, "OPT3001") != NULL) return ALS_TYPE_OPT3001;
-
-    return ALS_TYPE_NONE;
+    if (strstr(name, "VEML7700") != NULL) return CAN_ALS_TYPE_VEML7700;
+    if (strstr(name, "OPT4001") != NULL) return CAN_ALS_TYPE_OPT4001;
+    if (strstr(name, "OPT3001") != NULL) return CAN_ALS_TYPE_OPT3001;
+#endif
+    return CAN_ALS_TYPE_NONE;
 }
 
 /* Helper function to get partition info byte */
@@ -332,6 +353,8 @@ static void twai_receive_task(void *arg) {
         if (twai_receive(&rx_msg, portMAX_DELAY) == ESP_OK) {
             uint32_t id = rx_msg.identifier;
 
+#if IS_MAIN_FIRMWARE
+            /* MAIN firmware: Handle START/STOP/SHUTDOWN commands */
             if (id == my_stop_id) {
                 ESP_LOGI(TAG, "Received STOP command");
                 g_tx_active = false;
@@ -358,7 +381,16 @@ static void twai_receive_task(void *arg) {
                 xSemaphoreTake(done_sem, 0);
                 xSemaphoreGive(done_sem);  /* Stop transmission */
 
-            } else if (id == my_reboot_id) {
+            } else
+#else
+            /* FACTORY firmware: Ignore START/STOP/SHUTDOWN (no sensors) */
+            if (id == my_stop_id || id == my_start_id || id == my_shutdown_id) {
+                ESP_LOGD(TAG, "FACTORY mode: Ignoring command 0x%03lX (no sensors)",
+                         (unsigned long)id);
+
+            } else
+#endif
+            if (id == my_reboot_id) {
                 /* Save state and reboot */
                 ESP_LOGI(TAG, "Received REBOOT command - saving state and rebooting...");
 #if defined(CONFIG_BME680_ENABLED) && BSEC_LIBRARY_AVAILABLE
@@ -418,7 +450,11 @@ static void twai_receive_task(void *arg) {
                 /* Respond with device info */
                 ESP_LOGI(TAG, "Received GET_INFO command");
 
+#if IS_MAIN_FIRMWARE
                 uint8_t status_flags = g_tx_active ? STATUS_FLAG_TX_ACTIVE : 0;
+#else
+                uint8_t status_flags = 0;  /* FACTORY: TX never active (no sensors) */
+#endif
                 uint8_t partition_info = get_partition_info();
                 can_format_info_response(g_node_id, get_sensor_flags(),
                                          get_als_type(), status_flags,
@@ -455,6 +491,7 @@ static void twai_receive_task(void *arg) {
     }
 }
 
+#if IS_MAIN_FIRMWARE
 static void twai_transmit_task(void *arg) {
     twai_message_t tx_msg;
     sensor_data_t latest[NUM_SENSORS] = {0};
@@ -542,15 +579,21 @@ static void twai_transmit_task(void *arg) {
         }
     }
 }
+#endif /* IS_MAIN_FIRMWARE */
 
 static void twai_control_task(void *arg) {
     ESP_LOGI(TAG, "TWAI control task started");
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    /* Give start semaphore to begin transmission automatically */
+#if AUTO_START_TX
+    /* MAIN firmware: Auto-start sensor transmission */
     xSemaphoreGive(start_sem);
     ESP_LOGI(TAG, "Auto-start: Enabled sensor transmission");
+#else
+    /* FACTORY firmware: Stay silent, wait for commands */
+    ESP_LOGI(TAG, "FACTORY mode: Ready for OTA updates (silent on CAN bus)");
+#endif
 
     /* Task done - delete itself */
     vTaskDelete(NULL);
@@ -559,10 +602,11 @@ static void twai_control_task(void *arg) {
 /* ======================== Main Application ======================== */
 
 void app_main(void) {
-    ESP_LOGI(TAG, "ESP32 Multi-Sensor CAN Node v%d.%d.%d starting...",
-             FIRMWARE_VERSION_MAJOR, FIRMWARE_VERSION_MINOR, FIRMWARE_VERSION_PATCH);
+    ESP_LOGI(TAG, "ESP32 CAN Node v%d.%d.%d (%s) starting...",
+             FIRMWARE_VERSION_MAJOR, FIRMWARE_VERSION_MINOR, FIRMWARE_VERSION_PATCH,
+             FIRMWARE_TYPE_STR);
 
-    /* Initialize NVS flash (required for BME680 calibration and node ID storage) */
+    /* Initialize NVS flash (required for calibration and node ID storage) */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_LOGW(TAG, "NVS partition needs erase, erasing...");
@@ -600,7 +644,8 @@ void app_main(void) {
         return;
     }
 
-    /* Create sensor queue */
+#if IS_MAIN_FIRMWARE
+    /* Create sensor queue (MAIN firmware only) */
     sensor_queue = xQueueCreate(SENSOR_QUEUE_DEPTH, sizeof(sensor_data_t));
     if (sensor_queue == NULL) {
         ESP_LOGE(TAG, "Failed to create sensor queue");
@@ -626,6 +671,7 @@ void app_main(void) {
         ESP_LOGW(TAG, "Continuing without BME680 support");
     }
 #endif /* CONFIG_BME680_ENABLED */
+#endif /* IS_MAIN_FIRMWARE */
 
     /* Configure and start TWAI (CAN) */
     twai_general_config_t g_config = {
@@ -655,6 +701,11 @@ void app_main(void) {
     ESP_LOGI(TAG, "TWAI initialized at 500 kbps");
 
     /* Create tasks */
+    /* Create CAN receive task (both FACTORY and MAIN) */
+    xTaskCreate(twai_receive_task, "TWAI_RX", 3072, NULL, CAN_RX_TASK_PRIO, NULL);
+
+#if IS_MAIN_FIRMWARE
+    /* Create sensor tasks (MAIN firmware only) */
     xTaskCreate(sensor_poll_task, "SENSOR_POLL", 3072, NULL, SENSOR_POLL_TASK_PRIO, NULL);
 
 #if defined(CONFIG_BME680_ENABLED) && BSEC_LIBRARY_AVAILABLE
@@ -662,12 +713,19 @@ void app_main(void) {
     ESP_LOGI(TAG, "BME680 sensor task created (10KB stack for BSEC)");
 #endif
 
-    xTaskCreate(twai_receive_task, "TWAI_RX", 3072, NULL, CAN_RX_TASK_PRIO, NULL);
+    /* Create CAN transmit task (MAIN firmware only) */
     xTaskCreate(twai_transmit_task, "TWAI_TX", 5120, NULL, CAN_TX_TASK_PRIO, NULL);
+#endif /* IS_MAIN_FIRMWARE */
+
+    /* Create control task (both, but behavior differs) */
     xTaskCreate(twai_control_task, "TWAI_CTRL", 2048, NULL, CAN_CTRL_TSK_PRIO, NULL);
 
     ESP_LOGI(TAG, "All tasks created successfully");
-    ESP_LOGI(TAG, "System ready - waiting for START command");
+#if IS_MAIN_FIRMWARE
+    ESP_LOGI(TAG, "System ready - sensor transmission will auto-start");
+#else
+    ESP_LOGI(TAG, "FACTORY mode ready - awaiting OTA updates");
+#endif
 
     /* Main task: Periodic status logging and OTA timeout check */
     while (1) {
@@ -676,7 +734,8 @@ void app_main(void) {
         /* Check for OTA session timeout */
         ota_handler_check_timeout();
 
-        /* Read current lux for status */
+#if IS_MAIN_FIRMWARE
+        /* Read current lux for status (MAIN firmware only) */
         float current_lux;
         if (als_read_lux(&current_lux) == ESP_OK) {
             ESP_LOGI(TAG, "Status: %s, %.1f lux, Config: %d, Queue: %d/%d, Heap: %d KB",
@@ -687,5 +746,9 @@ void app_main(void) {
                      SENSOR_QUEUE_DEPTH,
                      esp_get_free_heap_size() / 1024);
         }
+#else
+        /* FACTORY firmware: Just log heap status */
+        ESP_LOGI(TAG, "FACTORY status: Heap: %d KB free", esp_get_free_heap_size() / 1024);
+#endif
     }
 }

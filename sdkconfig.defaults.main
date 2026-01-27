@@ -1,0 +1,19 @@
+# sdkconfig.defaults.main - Full-featured MAIN firmware
+# Used with: ./build.sh --type=main
+
+# Partition table
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# Enable all sensors
+CONFIG_BME680_ENABLED=y
+
+# Performance optimization (MAIN has plenty of space)
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# Logging - INFO level for debugging
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# FreeRTOS tick rate
+CONFIG_FREERTOS_HZ=100
