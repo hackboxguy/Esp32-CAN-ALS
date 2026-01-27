@@ -1,54 +1,28 @@
 # main/CMakeLists.txt
 #
-# Supports two firmware types:
-#   FACTORY - Minimal firmware with OTA support only
-#   MAIN    - Full-featured firmware with all sensors
-#
-# Build with: idf.py build -DFIRMWARE_TYPE=FACTORY
-#         or: idf.py build -DFIRMWARE_TYPE=MAIN (default)
+# ESP32-CAN-Sensor firmware with full sensor support
 
-# Check firmware type from command line (default to MAIN)
-if(NOT DEFINED FIRMWARE_TYPE)
-    set(FIRMWARE_TYPE "MAIN")
-endif()
-
-message(STATUS "")
-message(STATUS "========================================")
-message(STATUS "  Firmware Type: ${FIRMWARE_TYPE}")
-message(STATUS "========================================")
-message(STATUS "")
-
-# Base sources (always included for both FACTORY and MAIN)
+# Source files
 set(SRCS
     "main.c"
     "can_protocol.c"
     "ota_handler.c"
+    "als_driver.c"
+    "veml7700_driver.c"
+    "opt4001_driver.c"
+    "opt3001_driver.c"
+    "bme680_bsec.c"
 )
 
-# Base dependencies (always required)
+# Dependencies
 set(REQUIRES
     driver
     esp_timer
     nvs_flash
     app_update
     esp_partition
+    bsec
 )
-
-# Sensor sources and dependencies (MAIN only)
-if(FIRMWARE_TYPE STREQUAL "MAIN")
-    message(STATUS "Including sensor drivers (MAIN build)")
-    list(APPEND SRCS
-        "als_driver.c"
-        "veml7700_driver.c"
-        "opt4001_driver.c"
-        "opt3001_driver.c"
-        "bme680_bsec.c"
-    )
-    # BSEC library required for BME680
-    list(APPEND REQUIRES bsec)
-else()
-    message(STATUS "Excluding sensor drivers (FACTORY build)")
-endif()
 
 # Register the component
 idf_component_register(
@@ -56,13 +30,6 @@ idf_component_register(
     INCLUDE_DIRS "."
     REQUIRES ${REQUIRES}
 )
-
-# Add firmware type as compile definition (after component registration)
-if(FIRMWARE_TYPE STREQUAL "FACTORY")
-    target_compile_definitions(${COMPONENT_LIB} PRIVATE FIRMWARE_TYPE=0)
-else()
-    target_compile_definitions(${COMPONENT_LIB} PRIVATE FIRMWARE_TYPE=1)
-endif()
 
 # Add firmware version as compile definitions if provided via -D flags
 if(DEFINED FIRMWARE_VERSION_MAJOR)

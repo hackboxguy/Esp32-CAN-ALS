@@ -1,32 +1,18 @@
-# sdkconfig.defaults.factory - Minimal FACTORY firmware
-# Used with: ./build.sh --type=factory
-# Target size: < 256KB (current: ~190KB)
+# sdkconfig.defaults - ESP32-CAN-Sensor firmware configuration
 
-# Partition table (same as main)
+# Partition table (A/B OTA)
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
-# DISABLE sensors for factory build
-CONFIG_BME680_ENABLED=n
+# Enable all sensors
+CONFIG_BME680_ENABLED=y
 
-# Size optimization (critical for minimal size)
-CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+# Performance optimization
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
 
-# Use newlib nano (smaller C library)
-CONFIG_NEWLIB_NANO_FORMAT=y
-
-# Logging - WARN level to reduce binary size
-CONFIG_LOG_DEFAULT_LEVEL_WARN=y
-CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y
+# Logging - INFO level for debugging
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 
 # FreeRTOS tick rate
 CONFIG_FREERTOS_HZ=100
-
-# Reduce stack sizes where safe
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=3072
-CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=1024
-
-# Disable unused features for smaller binary
-CONFIG_ESP_ERR_TO_NAME_LOOKUP=n
-CONFIG_ESP_SYSTEM_PANIC_PRINT_HALT=y

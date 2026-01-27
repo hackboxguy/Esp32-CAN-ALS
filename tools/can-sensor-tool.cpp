@@ -1191,13 +1191,10 @@ static void print_info_response(const InfoResponse& info, OutputFormat format) {
     const char* partition = get_partition_type_name(info.partition_info);
     const char* ota_state = get_ota_state_name(info.partition_info);
 
-    // Determine firmware type: FACTORY has no sensors (sensor_flags=0), MAIN has sensors
-    const char* fw_type = (info.sensor_flags == 0) ? "FACTORY" : "MAIN";
-
     switch (format) {
         case OutputFormat::HUMAN:
             printf("Device Info (Node %d):\n", info.node_id);
-            printf("  Firmware:    v%d.%d.%d (%s)\n", info.fw_major, info.fw_minor, info.fw_patch, fw_type);
+            printf("  Firmware:    v%d.%d.%d\n", info.fw_major, info.fw_minor, info.fw_patch);
             printf("  Partition:   %s (%s)\n", partition, ota_state);
             printf("  Base Addr:   0x%03X\n", can_protocol::BASE_ADDR_NODE_0 + info.node_id * can_protocol::NODE_ADDR_SPACING);
             printf("  Sensors:     ");
@@ -1211,11 +1208,11 @@ static void print_info_response(const InfoResponse& info, OutputFormat format) {
             break;
 
         case OutputFormat::JSON:
-            printf("{\"type\":\"info\",\"node\":%d,\"firmware\":\"%d.%d.%d\",\"firmware_type\":\"%s\","
+            printf("{\"type\":\"info\",\"node\":%d,\"firmware\":\"%d.%d.%d\","
                    "\"partition\":\"%s\",\"ota_state\":\"%s\","
                    "\"base_addr\":\"0x%03X\",\"sensors\":{\"als\":%s,\"als_type\":\"%s\","
                    "\"bme\":%s,\"bme_type\":\"%s\",\"ld2410\":%s,\"mq3\":%s},\"tx_active\":%s}\n",
-                   info.node_id, info.fw_major, info.fw_minor, info.fw_patch, fw_type,
+                   info.node_id, info.fw_major, info.fw_minor, info.fw_patch,
                    partition, ota_state,
                    can_protocol::BASE_ADDR_NODE_0 + info.node_id * can_protocol::NODE_ADDR_SPACING,
                    has_als ? "true" : "false", get_als_type_name(info.als_type),
@@ -1226,8 +1223,8 @@ static void print_info_response(const InfoResponse& info, OutputFormat format) {
             break;
 
         case OutputFormat::CSV:
-            printf("info,%d,%d.%d.%d,%s,%s,%s,0x%03X,%d,%s,%d,%d,%d,%d\n",
-                   info.node_id, info.fw_major, info.fw_minor, info.fw_patch, fw_type,
+            printf("info,%d,%d.%d.%d,%s,%s,0x%03X,%d,%s,%d,%d,%d,%d\n",
+                   info.node_id, info.fw_major, info.fw_minor, info.fw_patch,
                    partition, ota_state,
                    can_protocol::BASE_ADDR_NODE_0 + info.node_id * can_protocol::NODE_ADDR_SPACING,
                    has_als ? 1 : 0, get_als_type_name(info.als_type),

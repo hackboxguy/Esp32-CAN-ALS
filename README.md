@@ -98,21 +98,36 @@ sudo ip link set up can0
 ## Building and Flashing
 
 ### ESP32 Firmware
+
+Use the provided `build.sh` script for simplified builds:
+
 ```bash
 git clone https://github.com/hackboxguy/Esp32-CAN-ALS.git
 cd Esp32-CAN-ALS/
 
-# Set target (adjust for your ESP32 variant)
-idf.py set-target esp32c6
+# First build (specify target)
+./build.sh --target=esp32c3 --version=1.0.0
+
+# Rebuild (target remembered)
+./build.sh
 
 # Build and flash
-idf.py build flash monitor
+./build.sh --target=esp32c3 --flash --port=/dev/ttyACM0
+
+# Flash existing binary without rebuilding
+./build.sh --flash-only --port=/dev/ttyACM0
+
+# Clean build
+./build.sh --clean --target=esp32c3
+
+# With BSEC library for BME680/688 support
+./build.sh --target=esp32c3 --bsecpath=/path/to/bsec.zip
 ```
 
-### Version Override (Optional)
+Or use idf.py directly:
 ```bash
-# Build with custom version number
-idf.py build -DCMAKE_C_FLAGS="-DFIRMWARE_VERSION_PATCH=1"
+idf.py set-target esp32c3
+idf.py build flash monitor
 ```
 
 ### CAN Sensor Tool
@@ -146,49 +161,55 @@ The `can-sensor-tool` is the primary management interface for ESP32 sensor nodes
 #### Device Discovery
 ```bash
 # Ping all nodes (discover devices on the bus)
-can-sensor-tool --ping
+can-sensor-tool ping
+
+# Get device info for node 0
+can-sensor-tool info
 
 # Get device info for specific node
-can-sensor-tool --node=0 --info
-
-# Get device info for all nodes
-can-sensor-tool --info --ping
+can-sensor-tool --node=1 info
 ```
 
 #### Monitoring
 ```bash
 # Monitor all sensor messages
-can-sensor-tool --monitor
+can-sensor-tool monitor
 
 # Monitor specific node
-can-sensor-tool --node=1 --monitor
+can-sensor-tool --node=1 monitor
 ```
 
 #### Node Management
 ```bash
 # Stop sensor transmission
-can-sensor-tool --node=0 --stop
+can-sensor-tool stop
 
 # Start sensor transmission
-can-sensor-tool --node=0 --start
+can-sensor-tool start
 
 # Reboot node (saves calibration first)
-can-sensor-tool --node=0 --reboot
+can-sensor-tool reboot
 
 # Factory reset (clears calibration)
-can-sensor-tool --node=0 --factory-reset
+can-sensor-tool factory-reset
 
 # Change node ID (0-5)
-can-sensor-tool --node=0 --set-node-id=2
+can-sensor-tool set-id 2
+
+# Commands for specific node
+can-sensor-tool --node=1 reboot
 ```
 
 #### A/B Firmware Updates
 ```bash
 # Upload new firmware to node 0
-can-sensor-tool --node=0 --ota=build/esp32-can-als.bin
+can-sensor-tool update ./build/esp32-can-sensor.bin
+
+# Upload to specific node
+can-sensor-tool --node=1 update ./build/esp32-can-sensor.bin
 
 # Upload with custom chunk delay (for noisy CAN buses)
-can-sensor-tool --node=0 --ota=firmware.bin --chunk-delay=5
+can-sensor-tool --chunk-delay=5 update ./build/esp32-can-sensor.bin
 ```
 
 **OTA Features:**
@@ -197,6 +218,56 @@ can-sensor-tool --node=0 --ota=firmware.bin --chunk-delay=5
 - Progress display with ETA
 - Automatic retry with exponential backoff
 - Safe: keeps old firmware until new one is validated
+
+### A/B OTA Update Mechanism
+
+The firmware uses ESP-IDF's standard A/B OTA partition scheme for safe, reliable updates:
+
+```
+Flash Layout (4MB):
+┌─────────────────┐ 0x000000
+│   Bootloader    │
+├─────────────────┤ 0x009000
+│      NVS        │ (24KB - calibration, node ID)
+├─────────────────┤ 0x010000
+│    OTA Data     │ (8KB - tracks active partition)
+├─────────────────┤ 0x020000
+│     OTA_0       │ (~1.94MB - firmware slot A)
+├─────────────────┤ 0x210000
+│     OTA_1       │ (~1.94MB - firmware slot B)
+└─────────────────┘ 0x400000
+```
+
+**How it works:**
+1. Initial USB flash writes firmware to OTA_0
+2. First CAN OTA update writes to OTA_1, reboots to OTA_1
+3. Next CAN OTA update writes to OTA_0, reboots to OTA_0
+4. Continues alternating (ping-pong) between slots
+
+**Automatic Rollback:**
+- New firmware must call `esp_ota_mark_app_valid()` within first boot
+- If firmware crashes before validation, bootloader reverts to previous slot
+- After 3 failed boot attempts, automatically rolls back
+
+**Example OTA session:**
+```bash
+# Check current partition
+$ can-sensor-tool info
+Device Info (Node 0):
+  Firmware:    v1.0.1
+  Partition:   ota_0 (valid)     # Currently running from OTA_0
+
+# Perform OTA update
+$ can-sensor-tool update ./build/esp32-can-sensor.bin
+Uploading: [==============================] 100% (345040/345040) 3.3 KB/s
+Update complete! Node 0 is rebooting to new firmware.
+
+# Verify - now on OTA_1
+$ can-sensor-tool info
+Device Info (Node 0):
+  Firmware:    v1.0.1
+  Partition:   ota_1 (valid)     # Now running from OTA_1
+```
 
 ### Direct CAN Commands
 
@@ -331,8 +402,9 @@ Esp32-CAN-ALS/
 
 - **CAN Bus Speed:** 500 kbps
 - **I2C Speed:** 100 kHz
-- **OTA Transfer Speed:** ~3 KB/s
-- **Flash Usage:** ~295 KB
+- **OTA Transfer Speed:** ~3.3 KB/s
+- **Firmware Size:** ~302-345 KB (15-17% of partition)
+- **OTA Partition Size:** ~1.94 MB each (A/B slots)
 - **RAM Usage:** ~90 KB
 - **Max Nodes:** 6 (IDs 0-5)
 
@@ -348,11 +420,11 @@ Esp32-CAN-ALS/
 **Sensor not detected:**
 - Check I2C connections (SDA/SCL)
 - Verify correct I2C address for sensor
-- Use `can-sensor-tool --info` to see detected sensors
+- Use `can-sensor-tool info` to see detected sensors
 
 **OTA update fails:**
-- Ensure node is responding: `can-sensor-tool --node=0 --ping`
-- Try with longer chunk delay: `--chunk-delay=10`
+- Ensure node is responding: `can-sensor-tool ping`
+- Try with longer chunk delay: `can-sensor-tool --chunk-delay=10 update firmware.bin`
 - Check for CAN bus errors: `ip -s link show can0`
 
 **IAQ readings stuck at defaults:**
@@ -368,7 +440,10 @@ candump can0 -t z
 ip -s -d link show can0
 
 # Get device info
-can-sensor-tool --node=0 --info
+can-sensor-tool info
+
+# Check all nodes
+can-sensor-tool ping
 ```
 
 ## License
