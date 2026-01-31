@@ -817,7 +817,7 @@ static uint16_t calc_checksum(const uint8_t* data, size_t len) {
     return sum;
 }
 
-// Parse ALS message (0x0A2)
+// Parse ALS message (0x100)
 static bool parse_als_message(const struct can_frame& frame, AlsData& data) {
     if (frame.can_dlc < 8) return false;
 
@@ -835,7 +835,7 @@ static bool parse_als_message(const struct can_frame& frame, AlsData& data) {
     return true;
 }
 
-// Parse Environmental message (0x0A3)
+// Parse Environmental message (0x101)
 static bool parse_env_message(const struct can_frame& frame, EnvData& data) {
     if (frame.can_dlc < 8) return false;
 
@@ -860,7 +860,7 @@ static bool parse_env_message(const struct can_frame& frame, EnvData& data) {
     return true;
 }
 
-// Parse Air Quality message (0x0A4)
+// Parse Air Quality message (0x102)
 static bool parse_aiq_message(const struct can_frame& frame, AiqData& data) {
     if (frame.can_dlc < 8) return false;
 

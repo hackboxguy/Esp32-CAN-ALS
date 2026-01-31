@@ -36,7 +36,7 @@ Updated the VEML7700 lux CAN message format from 2-byte (0-65,535 lux) to 3-byte
 
 ### 2. CAN Protocol Changes
 
-#### Old Format (0x0A2):
+#### Old Format (0x100):
 ```
 Byte 0-1: Lux value (uint16_t, 0-65535)
 Byte 2:   Status
@@ -46,7 +46,7 @@ Byte 5:   Reserved (0x00)
 Byte 6-7: Checksum
 ```
 
-#### New Format (0x0A2):
+#### New Format (0x100):
 ```
 Byte 0-2: Lux value (uint24_t, 0-16,777,215)  ← 3 bytes now
 Byte 3:   Status
@@ -57,7 +57,7 @@ Byte 6-7: Checksum
 
 **Key Points:**
 - Message still 8 bytes (within CAN limit)
-- Message ID unchanged (0x0A2)
+- Message ID unchanged (0x100)
 - Eliminated reserved byte (now used for lux MSB)
 - All other fields shifted by 1 byte position
 
@@ -103,7 +103,7 @@ candump can0
 # Expected format for ~60K lux in sunlight:
 # Example: 60000 lux = 0x00EA60
 # Bytes 0-2: 60 EA 00 (little-endian)
-# can0  0A2   [8]  60 EA 00 00 XX YY CS CS
+# can0  100   [8]  60 EA 00 00 XX YY CS CS
 #                   ^-----^  |  |  |  ^---^
 #                   Lux(3B)  St Sq Cf Checksum
 ```

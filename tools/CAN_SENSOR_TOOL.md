@@ -33,20 +33,22 @@ cd tools && mkdir build && cd build && cmake .. && make
 
 ## Node ID Addressing Scheme
 
-Each sensor node has a configurable base address with 16 message IDs reserved:
+Each sensor node has a configurable base address with 32 message IDs reserved:
 
 | Node ID | Base Address | Message Range | OTA Cmd ID | OTA Resp ID |
 |---------|--------------|---------------|------------|-------------|
-| 0 | 0x0A0 | 0x0A0 - 0x0AF | 0x700 | 0x708 |
-| 1 | 0x0B0 | 0x0B0 - 0x0BF | 0x710 | 0x718 |
-| 2 | 0x0C0 | 0x0C0 - 0x0CF | 0x720 | 0x728 |
-| 3 | 0x0D0 | 0x0D0 - 0x0DF | 0x730 | 0x738 |
-| 4 | 0x0E0 | 0x0E0 - 0x0EF | 0x740 | 0x748 |
-| 5 | 0x0F0 | 0x0F0 - 0x0FF | 0x750 | 0x758 |
+| 0 | 0x100 | 0x100 - 0x11F | 0x700 | 0x708 |
+| 1 | 0x120 | 0x120 - 0x13F | 0x710 | 0x718 |
+| 2 | 0x140 | 0x140 - 0x15F | 0x720 | 0x728 |
+| 3 | 0x160 | 0x160 - 0x17F | 0x730 | 0x738 |
+| 4 | 0x180 | 0x180 - 0x19F | 0x740 | 0x748 |
+| 5 | 0x1A0 | 0x1A0 - 0x1BF | 0x750 | 0x758 |
+| ... | ... | ... | ... | ... |
+| 15 | 0x2E0 | 0x2E0 - 0x2FF | 0x7F0 | 0x7F8 |
 
-**Maximum nodes:** 6 (using CAN ID range 0x0A0-0x0FF for sensors, 0x700-0x758 for OTA)
+**Maximum nodes:** 16 (node IDs 0-15, base addresses 0x100-0x2FF)
 
-**Default:** Node ID 0 (base 0x0A0) - backward compatible with existing firmware
+**Default:** Node ID 0 (base 0x100)
 
 **Storage:** Node ID stored in ESP32 NVS, persists across reboots
 
@@ -57,7 +59,7 @@ Each sensor node has a configurable base address with 16 message IDs reserved:
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--interface=<iface>` | `can0` | CAN interface name |
-| `--node-id=<id>` | `0` | Target node ID (0-5) |
+| `--node-id=<id>` | `0` | Target node ID (0-15) |
 | `--quiet` | off | Suppress status messages, output data only |
 | `--help` | - | Show help message |
 | `--version` | - | Show tool version |
@@ -84,7 +86,7 @@ can-sensor-tool monitor --timeout=30     # Stop after N seconds
 
 #### Configuration Commands
 ```bash
-can-sensor-tool set-node-id <new_id>     # Set node ID (0-5), triggers reboot
+can-sensor-tool set-node-id <new_id>     # Set node ID (0-15), triggers reboot
 can-sensor-tool info                     # Query device info/version/partition
 can-sensor-tool discover                 # Scan bus for all nodes
 ```
@@ -142,12 +144,12 @@ $ can-sensor-tool info
 Device Info (Node 0):
   Firmware:    v1.0.1
   Partition:   ota_0 (valid)
-  Base Addr:   0x0A0
+  Base Addr:   0x100
   Sensors:     ALS(VEML7700) BME680
   TX Active:   Yes
 ```
 
-### INFO_RESPONSE Message Format (0x0AD)
+### INFO_RESPONSE Message Format (0x117)
 
 ```
 Byte 0: Current node ID
@@ -155,7 +157,7 @@ Byte 1: Firmware version major
 Byte 2: Firmware version minor
 Byte 3: Firmware version patch
 Byte 4: Sensor flags (bit 0: ALS, bit 1: BME680, bit 2: LD2410, bit 3: MQ-3)
-Byte 5: ALS type (0=none, 1=VEML7700, 2=OPT4001)
+Byte 5: ALS type (0=none, 1=VEML7700, 2=OPT4001, 3=OPT3001)
 Byte 6: Status flags (bit 0: transmitting)
 Byte 7: Partition info (bits 0-2: type, bits 4-6: OTA state)
 ```
@@ -287,26 +289,26 @@ OTA uses a separate ID range (0x700+) to avoid conflicts with sensor data.
 
 | Offset | ID (Node 0) | Direction | Description |
 |--------|-------------|-----------|-------------|
-| +0x00 | 0x0A0 | RX | STOP - Stop transmission |
-| +0x01 | 0x0A1 | RX | START - Start transmission |
-| +0x02 | 0x0A2 | TX | Ambient light data (1 Hz) |
-| +0x03 | 0x0A3 | TX | Environmental data T/H/P (0.33 Hz) |
-| +0x04 | 0x0A4 | TX | Air quality IAQ/CO2/VOC (0.33 Hz) |
-| +0x07 | 0x0A7 | TX | System status (0.1 Hz) |
-| +0x08 | 0x0A8 | RX | SHUTDOWN - Graceful shutdown |
-| +0x09 | 0x0A9 | RX | REBOOT - Save state and reboot |
-| +0x0A | 0x0AA | RX | FACTORY_RESET - Clear calibration |
-| +0x0B | 0x0AB | RX | SET_NODE_ID - Set new node ID |
-| +0x0C | 0x0AC | RX | GET_INFO - Request device info |
-| +0x0D | 0x0AD | TX | INFO_RESPONSE - Device info |
-| +0x0E | 0x0AE | RX | PING - Discovery ping |
-| +0x0F | 0x0AF | TX | PONG - Discovery response |
+| +0x10 | 0x110 | RX | STOP - Stop transmission |
+| +0x11 | 0x111 | RX | START - Start transmission |
+| +0x00 | 0x100 | TX | Ambient light data (1 Hz) |
+| +0x01 | 0x101 | TX | Environmental data T/H/P (0.33 Hz) |
+| +0x02 | 0x102 | TX | Air quality IAQ/CO2/VOC (0.33 Hz) |
+| +0x0F | 0x10F | TX | System status (0.1 Hz) |
+| +0x12 | 0x112 | RX | SHUTDOWN - Graceful shutdown |
+| +0x13 | 0x113 | RX | REBOOT - Save state and reboot |
+| +0x14 | 0x114 | RX | FACTORY_RESET - Clear calibration |
+| +0x15 | 0x115 | RX | SET_NODE_ID - Set new node ID |
+| +0x16 | 0x116 | RX | GET_INFO - Request device info |
+| +0x17 | 0x117 | TX | INFO_RESPONSE - Device info |
+| +0x18 | 0x118 | RX | PING - Discovery ping |
+| +0x19 | 0x119 | TX | PONG - Discovery response |
 
 ### Discovery Protocol
 
-1. Tool sends PING to each possible base address: 0x0AE, 0x0BE, 0x0CE, 0x0DE, 0x0EE, 0x0FE
+1. Tool sends PING to each possible node using the PING offset (base + 0x18)
 2. Wait 300ms for responses
-3. Nodes respond with PONG on their respective +0x0F offset
+3. Nodes respond with PONG on their respective +0x19 offset
 4. Tool collects and displays all responding nodes
 
 ## ESP32 Firmware Version

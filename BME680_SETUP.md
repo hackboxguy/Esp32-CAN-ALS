@@ -222,11 +222,11 @@ When BME680 is enabled, the firmware transmits environmental data via CAN:
 
 | CAN ID | Data Type | Rate |
 |--------|-----------|------|
-| 0x0A2 | Ambient Light (VEML7700/OPT4001) | 1 Hz |
-| 0x0A3 | Environmental (Temp/Humid/Press) | 0.33 Hz |
-| 0x0A4 | Air Quality (IAQ/CO2/VOC) | 0.33 Hz |
+| 0x100 | Ambient Light (VEML7700/OPT3001/OPT4001) | 1 Hz |
+| 0x101 | Environmental (Temp/Humid/Press) | 0.33 Hz |
+| 0x102 | Air Quality (IAQ/CO2/VOC) | 0.33 Hz |
 
-### Message Format - Environmental Data (0x0A3)
+### Message Format - Environmental Data (0x101)
 
 ```
 Byte 0-1: Temperature × 100 (int16_t, °C, little-endian)
@@ -241,7 +241,7 @@ Byte 7:   Checksum (sum of bytes 0-6)
 - Bytes [0x88, 0x13] → 0x1388 = 5000 → 50.00%RH
 - Bytes [0xE8, 0x03] → 0x03E8 = 1000 → 1000 hPa
 
-### Message Format - Air Quality (0x0A4)
+### Message Format - Air Quality (0x102)
 
 ```
 Byte 0-1: IAQ (uint16_t, 0-500, little-endian)

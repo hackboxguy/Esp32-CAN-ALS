@@ -13,7 +13,7 @@ Added support for OPT4001 ambient light sensor with automatic runtime detection.
 
 ✅ **Unified API**
 - Clean abstraction layer (als_driver.c/h)
-- Same CAN message format (0x0A2) for both sensors
+- Same CAN message format (0x100) for both sensors
 - Backward compatible with existing VEML7700 deployments
 
 ✅ **Sensor-Specific Handling**
@@ -49,8 +49,9 @@ To allow CAN clients to distinguish sensor types from the config field:
 
 **Example CAN Message Decoding:**
 ```
-Byte 5 = 0-20   → VEML7700 active
+Byte 5 = 0-20    → VEML7700 active
 Byte 5 = 100-111 → OPT4001 active
+Byte 5 = 200-211 → OPT3001 active
 ```
 
 ## OPT4001 vs VEML7700 Comparison
@@ -173,21 +174,21 @@ I (xxx) MULTI_SENSOR: Ambient light sensor (OPT4001) initialized successfully
 
 **VEML7700 (Indoor ~1000 lux):**
 ```
-can0  0A2   [8]  E8 03 00 00 XX 08 ...
+can0  100   [8]  E8 03 00 00 XX 08 ...
                   ^-----^     ^
                   1000 lux    Config 8 (VEML7700)
 ```
 
 **OPT4001 (Indoor ~1000 lux):**
 ```
-can0  0A2   [8]  E8 03 00 00 XX 67 ...
+can0  100   [8]  E8 03 00 00 XX 67 ...
                   ^-----^     ^
                   1000 lux    Config 103 (OPT4001, range 3)
 ```
 
 **OPT4001 (Sunlight ~100K lux):**
 ```
-can0  0A2   [8]  A0 86 01 00 XX 6A ...
+can0  100   [8]  A0 86 01 00 XX 6A ...
                   ^--------^     ^
                   100000 lux     Config 106 (OPT4001, range 6)
 ```
@@ -259,7 +260,7 @@ Potential improvements:
 - [ ] Add NVS storage for sensor type preference
 - [ ] Implement sensor health monitoring (detect disconnects)
 - [ ] Add support for OPT3001/OPT3002 (compatible protocol)
-- [ ] Expose sensor type via CAN status message (0x0A7)
+- [ ] Expose sensor type via CAN status message (0x10F)
 - [ ] Add compile-time sensor selection for size optimization
 
 ## Files Modified Summary

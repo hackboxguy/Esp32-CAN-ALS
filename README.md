@@ -7,9 +7,9 @@ A professional-grade automotive sensor node for CAN networks using ESP32 with mu
 This project implements a multi-sensor node for automotive CAN networks using:
 - **ESP32 microcontroller** (C6, C3, or other variants with CAN support)
 - **Multi-sensor support** with runtime auto-detection:
-  - **Ambient Light:** VEML7700 (0-120K lux) OR OPT4001 (0-2.2M lux)
+  - **Ambient Light:** VEML7700 (0-120K lux) OR OPT3001/OPT4001 (auto-range)
   - **Environmental:** BME680/BME688 (temperature, humidity, pressure, air quality)
-- **TJA1050 CAN transceiver** for robust automotive communication
+- **SN65HVD230 CAN transceiver** for robust automotive communication
 - **A/B OTA firmware updates** over CAN bus (~3 KB/s)
 - **Multi-node support** with configurable node IDs (0-15)
 
@@ -17,6 +17,7 @@ This project implements a multi-sensor node for automotive CAN networks using:
 
 - **Multi-sensor support** with runtime auto-detection
   - VEML7700: 0-120K lux with intelligent auto-ranging
+  - OPT3001: 0-83K lux, factory calibrated
   - OPT4001: 0-2.2M lux, factory calibrated
   - BME680/BME688: Temperature, humidity, pressure, IAQ/CO2/VOC
 - **A/B firmware updates** over CAN bus with rollback support
@@ -35,18 +36,21 @@ This project implements a multi-sensor node for automotive CAN networks using:
 - ESP32 development board (ESP32-C6, ESP32-C3, or compatible)
 - **Choose ambient light sensor (optional):**
   - VEML7700 (I2C address 0x10), OR
-  - OPT4001 (I2C address 0x44)
+  - OPT3001 / OPT4001 (I2C address 0x44, auto-detected)
 - **Environmental sensor (optional):**
   - BME680 or BME688 (I2C address 0x76 or 0x77)
-- TJA1050 CAN transceiver breakout board
+- SN65HVD230 CAN transceiver breakout board
 - CAN-to-USB adapter (for development/testing)
 
-**Note:** The firmware automatically detects which sensors are connected at runtime.
+**Notes:**
+- The firmware automatically detects which sensors are connected at runtime.
+- The current sensor PCB footprint supports **either** VEML7700 or OPT3001 (mount one). If both are mounted, VEML7700 is ignored.
+- The sensor and monitor boards include a buck converter (6-30V input, 12V typical) and provide stable 5V/3.3V locally. With a two-pair 6P4C cable, this functions as a simple “power-over-CAN” setup (one pair for CAN, one pair for power).
 
 ### Wiring Diagram
 
 ```
-ESP32          Sensors (I2C)            TJA1050             CAN Bus
+ESP32          Sensors (I2C)            SN65HVD230          CAN Bus
 -----          -------------            -------             -------
 GPIO6 (SDA)    <--> SDA (all sensors)
 GPIO7 (SCL)    <--> SCL (all sensors)
@@ -55,16 +59,16 @@ GND            ---> GND (all sensors)
 
 GPIO4 (CAN_TX) ---> TX
 GPIO5 (CAN_RX) <--- RX
-5V             ---> VCC
+3.3V           ---> VCC
 GND            ---> GND                 GND <-----------> GND
                                        CANH -----------> CAN_HIGH
                                        CANL -----------> CAN_LOW
 ```
 
 **Important Notes:**
-- TJA1050 requires 5V supply (logic pins are 3.3V compatible)
+- SN65HVD230 is 3.3V native (no level shifting needed with ESP32-C3)
 - Multiple I2C sensors share the same bus (different addresses)
-- Only ONE ambient light sensor at a time (VEML7700 OR OPT4001)
+- Only ONE ambient light sensor at a time (VEML7700 OR OPT3001/OPT4001)
 
 ## Software Prerequisites
 
@@ -337,7 +341,7 @@ Each node has 32 message IDs reserved (0x20 spacing), supporting up to 16 nodes:
 Byte 0-2: Lux value (24-bit LE, 0-16.7M lux)
 Byte 3:   Status (0x00=OK, 0x01=Error)
 Byte 4:   Sequence counter (0-255)
-Byte 5:   Config index (0-20=VEML7700, 100-111=OPT4001)
+Byte 5:   Config index (0-20=VEML7700, 100-111=OPT4001, 200-211=OPT3001)
 Byte 6-7: Checksum (16-bit LE)
 ```
 
@@ -366,7 +370,7 @@ Byte 1:   Firmware major version
 Byte 2:   Firmware minor version
 Byte 3:   Firmware patch version
 Byte 4:   Sensor flags (bit 0: ALS, bit 1: BME680, etc.)
-Byte 5:   ALS type (0=none, 1=VEML7700, 2=OPT4001)
+Byte 5:   ALS type (0=none, 1=VEML7700, 2=OPT4001, 3=OPT3001)
 Byte 6:   Status flags (bit 0: transmitting)
 Byte 7:   Partition info (bits 0-2: type, bits 4-6: OTA state)
 ```
@@ -401,6 +405,7 @@ Esp32-CAN-ALS/
 | Sensor | Measurement | Range | Accuracy |
 |--------|-------------|-------|----------|
 | VEML7700 | Lux | 0-120K | ±1.4% @ 70K |
+| OPT3001 | Lux | 0-83K | ±2% @ 100 |
 | OPT4001 | Lux | 0-2.2M | ±1.5% @ 870 |
 | BME680/688 | Temperature | -40 to +85°C | ±1.0°C |
 | BME680/688 | Humidity | 0-100% | ±3% RH |
@@ -458,6 +463,10 @@ can-sensor-tool ping
 ## License
 
 This project is open source (GPLv3). Feel free to modify and distribute according to your needs.
+
+## BSEC Licensing Note
+
+The BME680/BME688 air-quality features use Bosch Sensortec’s **BSEC 2.x** library, which is proprietary and not bundled in this repo. To enable it, download BSEC from Bosch, accept the license, and point `build.sh` to the zip (see `BME680_SETUP.md`).
 
 ## Contributing
 
