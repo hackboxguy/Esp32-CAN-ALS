@@ -1,0 +1,51 @@
+menu "BSEC Library Configuration"
+
+    config BME680_ENABLED
+        bool "Enable BME680/BME688 support (requires BSEC library)"
+        default n
+        help
+            Enable support for BME680/BME688 environmental sensors using
+            Bosch BSEC 2.x library.
+
+            This requires the proprietary BSEC library to be installed.
+            See components/bsec/README.md for setup instructions.
+
+            If disabled, the firmware will only support ambient light sensors
+            (VEML7700/OPT4001) and will build without BSEC dependencies.
+
+    config BME680_I2C_ADDR
+        hex "BME680 I2C Address"
+        depends on BME680_ENABLED
+        default 0x76
+        range 0x76 0x77
+        help
+            I2C address of the BME680/BME688 sensor.
+
+            Default: 0x76 (SDO pin low)
+            Alternate: 0x77 (SDO pin high)
+
+    config BME680_SAMPLE_RATE
+        int "BME680 Sample Rate (seconds)"
+        depends on BME680_ENABLED
+        default 3
+        range 1 60
+        help
+            How often to read the BME680 sensor (in seconds).
+
+            Recommended: 3 seconds (balances accuracy with power consumption)
+            BSEC requires regular sampling for accurate air quality calculation.
+
+    config BME680_SAVE_STATE_INTERVAL
+        int "BSEC State Save Interval (hours)"
+        depends on BME680_ENABLED
+        default 4
+        range 1 24
+        help
+            How often to save BSEC calibration state to NVS (in hours).
+
+            BSEC learns air quality baselines over time. Saving state
+            preserves calibration across reboots.
+
+            Recommended: 4 hours (balances wear leveling with state freshness)
+
+endmenu

@@ -1,594 +1,601 @@
-/* main.c - ESP32-C6 CAN Lux Sensor with VEML7700 Auto-Ranging */
+/* main.c - ESP32-C3/C6 Multi-Sensor CAN Node
+ *
+ * Full-featured firmware with all sensors and OTA support.
+ */
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <math.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
+#include <freertos/queue.h>
 #include <esp_log.h>
+#include <esp_timer.h>
+#include <esp_system.h>
+#include <esp_ota_ops.h>
+#include <nvs_flash.h>
 #include <driver/twai.h>
-#include <driver/i2c.h>
 
-#define CAN_TX_GPIO_NUM         GPIO_NUM_4
-#define CAN_RX_GPIO_NUM         GPIO_NUM_5
-#define I2C_SDA_GPIO_NUM        GPIO_NUM_6
-#define I2C_SCL_GPIO_NUM        GPIO_NUM_7
+#include "firmware_config.h"
+#include "can_protocol.h"
+#include "ota_handler.h"
+#include "sensor_common.h"
+#include "als_driver.h"
+
+/* Conditional BME680 support */
+#if defined(CONFIG_BME680_ENABLED) && BSEC_LIBRARY_AVAILABLE
+#include "bme680_bsec.h"
+#endif
+
+/* ======================== Configuration ======================== */
+
+#define CAN_TX_GPIO_NUM         GPIO_NUM_5
+#define CAN_RX_GPIO_NUM         GPIO_NUM_4
+
 #define CAN_TX_TASK_PRIO        8
 #define CAN_RX_TASK_PRIO        9
 #define CAN_CTRL_TSK_PRIO       10
+#define SENSOR_POLL_TASK_PRIO   5
+#define BME680_TASK_PRIO        6  /* Between ALS and transmit */
+
 #define CAN_DATA_PERIOD_MS      1000
-#define CAN_NO_WAIT             0
-#define CAN_WAIT_FOREVER        portMAX_DELAY
-#define ID_MASTER_STOP_CMD      0x0A0
-#define ID_MASTER_START_CMD     0x0A1
-#define ID_MASTER_DATA          0x0A2
+#define SENSOR_QUEUE_DEPTH      20
 
-// VEML7700 I2C Configuration
-#define I2C_MASTER_NUM          I2C_NUM_0
-#define I2C_MASTER_FREQ_HZ      100000
-#define VEML7700_I2C_ADDR       0x10
-#define VEML7700_REG_CONF       0x00
-#define VEML7700_REG_ALS        0x04
+/* NVS Configuration */
+#define NVS_NAMESPACE_NODE      "node_config"
+#define NVS_KEY_NODE_ID         "node_id"
 
-// VEML7700 Configuration Bits (aligned with datasheet)
-#define VEML7700_GAIN_1X        (0x00 << 11)  // 0x0000
-#define VEML7700_GAIN_2X        (0x01 << 11)  // 0x0800
-#define VEML7700_GAIN_1_4X      (0x02 << 11)  // 0x1000
-#define VEML7700_GAIN_1_8X      (0x03 << 11)  // 0x1800
+/* BME680 sample rate from Kconfig (default 3 seconds for LP mode) */
+#ifndef CONFIG_BME680_SAMPLE_RATE
+#define BME680_SAMPLE_RATE_SEC  3  /* BSEC LP mode: 3 seconds */
+#else
+#define BME680_SAMPLE_RATE_SEC  CONFIG_BME680_SAMPLE_RATE
+#endif
 
-#define VEML7700_IT_25MS        0x0300
-#define VEML7700_IT_50MS        0x0200
-#define VEML7700_IT_100MS       0x0000
-#define VEML7700_IT_200MS       0x0040
-#define VEML7700_IT_400MS       0x0080
-#define VEML7700_IT_800MS       0x00C0
+static const char *TAG = "MULTI_SENSOR";
 
-#define VEML7700_POWER_ON       0x0000
-#define VEML7700_POWER_OFF      0x0001
-
-// Auto-ranging parameters
-#define SATURATED_HIGH          60000   // Near ADC saturation
-#define OPTIMAL_HIGH            40000   // Upper optimal range
-#define OPTIMAL_LOW             10000   // Lower optimal range
-#define TOO_LOW                 2000    // Force sensitivity increase
-
-// History tracking for stability
-#define READING_HISTORY_SIZE    5
-#define SETTLE_READINGS_REQUIRED 3
-#define CONSISTENCY_READINGS    3
-
-// Moving average filter settings
-#define MOVING_AVG_SAMPLES      8
-
-static const char *TAG = "CAN_LUX_SENSOR";
+/* ======================== Global State ======================== */
 
 static SemaphoreHandle_t done_sem;
 static SemaphoreHandle_t start_sem;
+static QueueHandle_t sensor_queue;
+static bool g_tx_active = false;  /* Track if transmission is active */
 
-// Add this function to help debug the calibration
-static void debug_calibration(float raw_lux, float calibrated_lux, const char* range) {
-    ESP_LOGI(TAG, "Calibration debug: raw=%.1f, calibrated=%.1f, range=%s", 
-             raw_lux, calibrated_lux, range);
-}
+/* Node ID configuration (0-15, loaded from NVS) */
+static uint8_t g_node_id = 0;
 
-// calibration function(old but no so precise)
-static float calibrate_lux_old(float raw_lux) {
-    // Linear calibration based on your measurements: y = 0.0004x + 1.7
-    // where x is the raw lux value and y is the calibration factor
-    float calibration_factor = 0.0004f * raw_lux + 1.7f;
-    return raw_lux * calibration_factor;
-}
-static float calibrate_lux(float raw_lux) {
-    // Revised calibration based on your measurements
-    // Uses a polynomial fit for better accuracy across the range
-    if (raw_lux < 10.0f) {
-        return raw_lux * 0.85f;  // Adjustment for very low light
-    } else if (raw_lux < 100.0f) {
-        return raw_lux * 0.92f;  // Adjustment for low light
-    } else if (raw_lux < 500.0f) {
-        return raw_lux * 1.05f;  // Adjustment for medium light
-    } else if (raw_lux < 1000.0f) {
-        return raw_lux * 1.12f;  // Adjustment for high light
-    } else {
-        return raw_lux * 1.18f;  // Adjustment for very high light
-    }
-}
+/* ======================== NVS Node ID Functions ======================== */
 
-// VEML7700 Configuration Structure
-typedef struct {
-    uint16_t gain_bits;
-    uint16_t it_bits;
-    float gain_value;
-    float it_ms;
-    float resolution;  // counts per lux (approximate)
-} SensorConfig;
-
-// Helper functions for SensorConfig
-static uint16_t sensor_config_get_config_word(const SensorConfig* config) {
-    return config->gain_bits | config->it_bits | VEML7700_POWER_ON;
-}
-
-static const char* sensor_config_gain_str(const SensorConfig* config) {
-    if (config->gain_bits == VEML7700_GAIN_1X) return "1x";
-    if (config->gain_bits == VEML7700_GAIN_2X) return "2x";
-    if (config->gain_bits == VEML7700_GAIN_1_4X) return "1/4x";
-    if (config->gain_bits == VEML7700_GAIN_1_8X) return "1/8x";
-    return "?";
-}
-
-static const char* sensor_config_it_str(const SensorConfig* config) {
-    if (config->it_bits == VEML7700_IT_25MS) return "25ms";
-    if (config->it_bits == VEML7700_IT_50MS) return "50ms";
-    if (config->it_bits == VEML7700_IT_100MS) return "100ms";
-    if (config->it_bits == VEML7700_IT_200MS) return "200ms";
-    if (config->it_bits == VEML7700_IT_400MS) return "400ms";
-    if (config->it_bits == VEML7700_IT_800MS) return "800ms";
-    return "?";
-}
-
-// Configuration table based on C++ code (11 configurations)
-static const SensorConfig g_configs[] = {
-    // 2x gain configurations
-    {VEML7700_GAIN_2X, VEML7700_IT_800MS, 2.0f, 800.0f, 0.0036f},
-    {VEML7700_GAIN_2X, VEML7700_IT_400MS, 2.0f, 400.0f, 0.0072f},
-    {VEML7700_GAIN_2X, VEML7700_IT_200MS, 2.0f, 200.0f, 0.0144f},
-    {VEML7700_GAIN_2X, VEML7700_IT_100MS, 2.0f, 100.0f, 0.0288f},
-    {VEML7700_GAIN_2X, VEML7700_IT_50MS, 2.0f, 50.0f, 0.0576f},
-
-    // 1x gain configurations
-    {VEML7700_GAIN_1X, VEML7700_IT_800MS, 1.0f, 800.0f, 0.0072f},
-    {VEML7700_GAIN_1X, VEML7700_IT_400MS, 1.0f, 400.0f, 0.0144f},
-    {VEML7700_GAIN_1X, VEML7700_IT_200MS, 1.0f, 200.0f, 0.0288f},
-    {VEML7700_GAIN_1X, VEML7700_IT_100MS, 1.0f, 100.0f, 0.0576f},
-    {VEML7700_GAIN_1X, VEML7700_IT_50MS, 1.0f, 50.0f, 0.1152f},
-    {VEML7700_GAIN_1X, VEML7700_IT_25MS, 1.0f, 25.0f, 0.2304f},
-
-    // 1/4x gain configurations
-    {VEML7700_GAIN_1_4X, VEML7700_IT_800MS, 0.25f, 800.0f, 0.0288f},
-    {VEML7700_GAIN_1_4X, VEML7700_IT_400MS, 0.25f, 400.0f, 0.0576f},
-    {VEML7700_GAIN_1_4X, VEML7700_IT_200MS, 0.25f, 200.0f, 0.1152f},
-    {VEML7700_GAIN_1_4X, VEML7700_IT_100MS, 0.25f, 100.0f, 0.2304f},
-
-    // 1/8x gain configurations
-    {VEML7700_GAIN_1_8X, VEML7700_IT_800MS, 0.125f, 800.0f, 0.0576f},
-    {VEML7700_GAIN_1_8X, VEML7700_IT_400MS, 0.125f, 400.0f, 0.1152f},
-    {VEML7700_GAIN_1_8X, VEML7700_IT_200MS, 0.125f, 200.0f, 0.2304f},
-};
-
-#define NUM_CONFIGS (sizeof(g_configs) / sizeof(g_configs[0]))
-
-// Moving average filter structure
-typedef struct {
-    float samples[MOVING_AVG_SAMPLES];
-    int index;
-    int count;
-    float sum;
-} moving_avg_filter_t;
-
-// Intelligent range switching state
-typedef struct {
-    uint16_t raw_counts_history[READING_HISTORY_SIZE];
-    int history_index;
-    int history_count;
-    int readings_since_change;
-    bool range_change_pending;
-} range_switch_state_t;
-
-// State tracking
-static moving_avg_filter_t lux_filter = {0};
-static range_switch_state_t range_state = {0};
-static int current_config_idx = 7;  // Start with 1x gain, 100ms integration
-static TickType_t last_range_switch_time = 0;
-
-/* --------------------------- Moving Average Filter ------------------------ */
-
-static void moving_avg_init(moving_avg_filter_t *filter) {
-    memset(filter, 0, sizeof(moving_avg_filter_t));
-}
-
-static float moving_avg_update(moving_avg_filter_t *filter, float new_value) {
-    if (filter->count == MOVING_AVG_SAMPLES) {
-        filter->sum -= filter->samples[filter->index];
-    } else {
-        filter->count++;
-    }
-
-    filter->samples[filter->index] = new_value;
-    filter->sum += new_value;
-    filter->index = (filter->index + 1) % MOVING_AVG_SAMPLES;
-
-    return filter->sum / filter->count;
-}
-
-/* --------------------------- VEML7700 Functions --------------------------- */
-
-static esp_err_t i2c_master_init(void)
-{
-    i2c_config_t conf = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = I2C_SDA_GPIO_NUM,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_io_num = I2C_SCL_GPIO_NUM,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = I2C_MASTER_FREQ_HZ,
-    };
-
-    esp_err_t err = i2c_param_config(I2C_MASTER_NUM, &conf);
+static esp_err_t load_node_id_from_nvs(uint8_t *node_id) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE_NODE, NVS_READONLY, &handle);
     if (err != ESP_OK) {
-        return err;
+        /* Namespace doesn't exist - use default */
+        *node_id = 0;
+        return ESP_ERR_NVS_NOT_FOUND;
     }
 
-    return i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
-}
+    err = nvs_get_u8(handle, NVS_KEY_NODE_ID, node_id);
+    nvs_close(handle);
 
-static esp_err_t veml7700_write_reg(uint8_t reg, uint16_t data)
-{
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (VEML7700_I2C_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, reg, true);
-    i2c_master_write_byte(cmd, data & 0xFF, true);
-    i2c_master_write_byte(cmd, (data >> 8) & 0xFF, true);
-    i2c_master_stop(cmd);
-
-    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(100));
-    i2c_cmd_link_delete(cmd);
-
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "I2C write error: %s", esp_err_to_name(ret));
+    if (err != ESP_OK) {
+        *node_id = 0;  /* Default to node 0 */
     }
 
-    return ret;
-}
-
-static esp_err_t veml7700_read_reg(uint8_t reg, uint16_t *data)
-{
-    uint8_t data_rd[2];
-
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (VEML7700_I2C_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, reg, true);
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (VEML7700_I2C_ADDR << 1) | I2C_MASTER_READ, true);
-    i2c_master_read_byte(cmd, &data_rd[0], I2C_MASTER_ACK);
-    i2c_master_read_byte(cmd, &data_rd[1], I2C_MASTER_NACK);
-    i2c_master_stop(cmd);
-
-    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(100));
-    i2c_cmd_link_delete(cmd);
-
-    if (ret == ESP_OK) {
-        *data = (data_rd[1] << 8) | data_rd[0];
-    } else {
-        ESP_LOGE(TAG, "I2C read error: %s", esp_err_to_name(ret));
+    /* Validate range */
+    if (*node_id > CAN_MAX_NODE_ID) {
+        ESP_LOGW(TAG, "Invalid node ID %d in NVS, defaulting to 0", *node_id);
+        *node_id = 0;
     }
 
-    return ret;
+    return err;
 }
 
-static esp_err_t veml7700_read_raw_counts(uint16_t *counts)
-{
-    return veml7700_read_reg(VEML7700_REG_ALS, counts);
-}
-
-static esp_err_t veml7700_set_config(int config_idx)
-{
-    if (config_idx < 0 || config_idx >= NUM_CONFIGS) {
+static esp_err_t save_node_id_to_nvs(uint8_t node_id) {
+    if (node_id > CAN_MAX_NODE_ID) {
+        ESP_LOGE(TAG, "Invalid node ID %d (max %d)", node_id, CAN_MAX_NODE_ID);
         return ESP_ERR_INVALID_ARG;
     }
 
-    esp_err_t ret = veml7700_write_reg(VEML7700_REG_CONF, sensor_config_get_config_word(&g_configs[config_idx]));
-    if (ret == ESP_OK) {
-        current_config_idx = config_idx;
-        last_range_switch_time = xTaskGetTickCount();
-
-        // Reset moving average filter and range state after config change
-        moving_avg_init(&lux_filter);
-        range_state.readings_since_change = 0;
-        range_state.history_count = 0;
-        range_state.history_index = 0;
-
-        // Verify configuration was written correctly
-        uint16_t readback_config;
-        if (veml7700_read_reg(VEML7700_REG_CONF, &readback_config) == ESP_OK) {
-            ESP_LOGI(TAG, "Config %d: %s gain, %s integration, config=0x%04X, readback=0x%04X",
-                     config_idx,
-                     sensor_config_gain_str(&g_configs[config_idx]),
-                     sensor_config_it_str(&g_configs[config_idx]),
-                     sensor_config_get_config_word(&g_configs[config_idx]),
-                     readback_config);
-        }
-    }
-    return ret;
-}
-
-static esp_err_t veml7700_init(void)
-{
-    moving_avg_init(&lux_filter);
-    memset(&range_state, 0, sizeof(range_state));
-    return veml7700_set_config(current_config_idx);
-}
-
-/* --------------------------- Intelligent Auto-Ranging -------------------- */
-
-static void update_reading_history(uint16_t raw_counts) {
-    range_state.raw_counts_history[range_state.history_index] = raw_counts;
-    range_state.history_index = (range_state.history_index + 1) % READING_HISTORY_SIZE;
-
-    if (range_state.history_count < READING_HISTORY_SIZE) {
-        range_state.history_count++;
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE_NODE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS namespace: %s", esp_err_to_name(err));
+        return err;
     }
 
-    range_state.readings_since_change++;
-}
-
-static bool readings_consistently_high(void) {
-    if (range_state.history_count < CONSISTENCY_READINGS) return false;
-
-    int check_count = (range_state.history_count < CONSISTENCY_READINGS) ?
-                      range_state.history_count : CONSISTENCY_READINGS;
-
-    for (int i = 0; i < check_count; i++) {
-        int idx = (range_state.history_index - 1 - i + READING_HISTORY_SIZE) % READING_HISTORY_SIZE;
-        if (range_state.raw_counts_history[idx] <= OPTIMAL_HIGH) {
-            return false;
-        }
+    err = nvs_set_u8(handle, NVS_KEY_NODE_ID, node_id);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
     }
-    return true;
-}
+    nvs_close(handle);
 
-static bool readings_consistently_low(void) {
-    if (range_state.history_count < CONSISTENCY_READINGS) return false;
-
-    int check_count = (range_state.history_count < CONSISTENCY_READINGS) ?
-                      range_state.history_count : CONSISTENCY_READINGS;
-
-    for (int i = 0; i < check_count; i++) {
-        int idx = (range_state.history_index - 1 - i + READING_HISTORY_SIZE) % READING_HISTORY_SIZE;
-        if (range_state.raw_counts_history[idx] >= OPTIMAL_LOW) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static int determine_optimal_config(uint16_t raw_counts) {
-    // Update history
-    update_reading_history(raw_counts);
-
-    // Don't adjust immediately after a configuration change
-    if (range_state.readings_since_change < SETTLE_READINGS_REQUIRED) {
-        ESP_LOGD(TAG, "Settling after config change (%d/%d readings)",
-                 range_state.readings_since_change, SETTLE_READINGS_REQUIRED);
-        return current_config_idx;
-    }
-
-    // Determine if config adjustment is needed - SINGLE STEP ONLY
-    int adjustment = 0;
-    const char* reason = "";
-
-    // Critical thresholds - immediate action required
-    if (raw_counts >= SATURATED_HIGH || raw_counts >= 65000) {
-        // Near saturation - decrease sensitivity immediately
-        adjustment = 1;  // Move to less sensitive config
-        reason = raw_counts >= 64000 ? "SATURATED" : "TOO_HIGH";
-
-    } else if (raw_counts < TOO_LOW && raw_counts > 0) {
-        // Too low - increase sensitivity immediately
-        adjustment = -1;  // Move to more sensitive config
-        reason = raw_counts < 500 ? "VERY_LOW" : "TOO_LOW";
-
-    } else if (raw_counts >= OPTIMAL_LOW && raw_counts <= OPTIMAL_HIGH) {
-        // In optimal range - no change needed
-        ESP_LOGV(TAG, "Raw counts %d in optimal range (%d-%d)",
-                 raw_counts, OPTIMAL_LOW, OPTIMAL_HIGH);
-        return current_config_idx;
-
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Node ID %d saved to NVS", node_id);
     } else {
-        // In acceptable but not optimal range - use consistency check
-        if (raw_counts > OPTIMAL_HIGH && raw_counts < SATURATED_HIGH) {
-            // Check if consistently high
-            if (readings_consistently_high()) {
-                adjustment = 1;  // Less sensitive
-                reason = "CONSISTENTLY_HIGH";
-            }
-        } else if (raw_counts < OPTIMAL_LOW && raw_counts >= TOO_LOW) {
-            // Check if consistently low
-            if (readings_consistently_low()) {
-                adjustment = -1;  // More sensitive
-                reason = "CONSISTENTLY_LOW";
-            }
-        }
+        ESP_LOGE(TAG, "Failed to save node ID: %s", esp_err_to_name(err));
     }
 
-    // Apply single-step adjustment
-    if (adjustment != 0) {
-        int new_config_idx = current_config_idx + adjustment;
-
-        // Clamp to valid range
-        if (new_config_idx < 0) new_config_idx = 0;
-        if (new_config_idx >= NUM_CONFIGS) new_config_idx = NUM_CONFIGS - 1;
-
-        if (new_config_idx != current_config_idx) {
-            ESP_LOGI(TAG, "Config switch: %d->%d, reason=%s (raw_counts=%d)",
-                     current_config_idx, new_config_idx, reason, raw_counts);
-
-            return new_config_idx;
-        }
-    }
-
-    return current_config_idx;
+    return err;
 }
 
-static esp_err_t veml7700_read_lux_with_auto_ranging(float *stable_lux) {
-    uint16_t raw_counts;
-    esp_err_t ret = veml7700_read_raw_counts(&raw_counts);
+/* ======================== Sensor Poll Task ======================== */
 
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    // Apply intelligent auto-ranging
-    int optimal_config = determine_optimal_config(raw_counts);
-
-    // Switch config if needed
-    if (optimal_config != current_config_idx) {
-        ret = veml7700_set_config(optimal_config);
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "Config switch failed, continuing with current config");
-        } else {
-            // Wait for sensor to settle after config change
-            // Integration time * 3 + settling time, based on Linux implementation
-            float settle_time = g_configs[optimal_config].it_ms * 3.0f + 200;
-            vTaskDelay(pdMS_TO_TICKS((int)settle_time));
-
-            // Read fresh counts with new config and discard stale readings
-            for (int i = 0; i < 3; i++) {
-                ret = veml7700_read_raw_counts(&raw_counts);
-                if (ret != ESP_OK) {
-                    return ret;
-                }
-                vTaskDelay(pdMS_TO_TICKS(50));
-            }
-
-            // Update history with fresh reading
-            update_reading_history(raw_counts);
-        }
-    }
-
-    // Convert raw counts to lux
-    float raw_lux = raw_counts * g_configs[current_config_idx].resolution;
-
-    // Apply moving average filter for additional stability
-    float filtered_lux = moving_avg_update(&lux_filter, raw_lux);
-
-    // Apply calibration factor for Adafruit board with diffuser dome
-    const float DIFFUSER_CALIBRATION = 1.96f;//1.13f;
-    float calibrated_lux = filtered_lux * DIFFUSER_CALIBRATION;
-    //*stable_lux = filtered_lux * DIFFUSER_CALIBRATION;
-    *stable_lux = calibrate_lux(calibrated_lux);//extra calibration
-    if (*stable_lux < 0.0) *stable_lux = 0.0;
-
-    // Debug logging
-    const char* range = "unknown";
-    if (calibrated_lux < 50.0f) range = "low";
-    else if (calibrated_lux < 500.0f) range = "low-medium";
-    else if (calibrated_lux < 1000.0f) range = "medium-high";
-    else range = "high";
-    debug_calibration(calibrated_lux, *stable_lux, range);
-
-
-    //ESP_LOGV(TAG, "Sensor: raw_counts=%d, raw_lux=%.1f, filtered_lux=%.1f, final_lux=%.1f",
-    //         raw_counts, raw_lux, filtered_lux, *stable_lux);
-    //ESP_LOGV(TAG, "Sensor: raw_counts=%d, raw_lux=%.1f, filtered_lux=%.1f, calibrated_lux=%.1f, final_lux=%.1f",
-    //     raw_counts, raw_lux, filtered_lux, calibrated_lux, *stable_lux);
-
-    return ESP_OK;
-}
-
-/* --------------------------- Tasks and Functions -------------------------- */
-
-static void twai_receive_task(void *arg)
-{
-    twai_message_t rx_msg;
-
-    while (1) {
-        if (twai_receive(&rx_msg, CAN_WAIT_FOREVER) == ESP_OK) {
-            if (!(rx_msg.flags & TWAI_MSG_FLAG_RTR)) {
-                if (rx_msg.identifier == ID_MASTER_STOP_CMD) {
-                    xSemaphoreGive(done_sem);
-                } else if (rx_msg.identifier == ID_MASTER_START_CMD) {
-                    xSemaphoreGive(start_sem);
-                }
-            }
-        }
-    }
-}
-
-static void twai_transmit_task(void *arg)
-{
-    twai_message_t tx_msg;
-    float lux_value = 0.0;
-    uint16_t lux_int = 0;
-    uint8_t sequence_counter = 0;
-    uint8_t sensor_status = 0x00;
+static void sensor_poll_task(void *arg) {
+    sensor_data_t msg;
     TickType_t xLastWakeTime = xTaskGetTickCount();
 
-    tx_msg.identifier = ID_MASTER_DATA;
-    tx_msg.flags = TWAI_MSG_FLAG_NONE;
-    tx_msg.data_length_code = 8;
+    ESP_LOGI(TAG, "Sensor poll task started");
 
     while (1) {
-        if (xSemaphoreTake(start_sem, portMAX_DELAY) != pdTRUE) {
-            continue;
+        /* Always read and queue - let transmit task control when to send */
+        {
+            /* Read ambient light sensor (VEML7700 or OPT4001) */
+            msg.sensor_id = SENSOR_VEML7700;  // Keep same ID for CAN compatibility
+            msg.timestamp_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+
+            if (als_read_lux(&msg.data.veml.lux) == ESP_OK) {
+                msg.status = SENSOR_STATUS_OK;
+                msg.data.veml.config_idx = als_get_config_idx();
+                ESP_LOGD(TAG, "Read ALS (%s): %.1f lux, config=%d",
+                         als_get_sensor_name(), msg.data.veml.lux, msg.data.veml.config_idx);
+            } else {
+                msg.status = SENSOR_STATUS_ERROR;
+                msg.data.veml.lux = 0.0f;
+                ESP_LOGW(TAG, "ALS read failed");
+            }
+
+            /* Send to queue */
+            if (xQueueSend(sensor_queue, &msg, 0) != pdTRUE) {
+                ESP_LOGW(TAG, "Sensor queue full, dropping ALS reading");
+            } else {
+                ESP_LOGD(TAG, "Queued sensor data");
+            }
         }
+
+        /* Periodic delay (1 Hz for VEML7700) */
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(1000));
+    }
+}
+
+/* ======================== BME680 Sensor Task ======================== */
+
+#if defined(CONFIG_BME680_ENABLED) && BSEC_LIBRARY_AVAILABLE
+static void bme680_sensor_task(void *arg) {
+    sensor_data_t msg;
+    bme68x_data_t bme_data;
+
+    ESP_LOGI(TAG, "BME680 sensor task started (BSEC-driven timing)");
+
+    /* Wait for initial BSEC next_call time (set during init) */
+    uint64_t next_call_ms = bme680_get_next_call_ms();
+    if (next_call_ms > 0) {
+        uint64_t now_ms = esp_timer_get_time() / 1000;
+        if (next_call_ms > now_ms) {
+            uint64_t wait_ms = next_call_ms - now_ms;
+            ESP_LOGI(TAG, "Waiting %llu ms until first BSEC measurement", wait_ms);
+            vTaskDelay(pdMS_TO_TICKS(wait_ms));
+        }
+    }
+
+    while (1) {
+        /* Read BME680 sensor at BSEC-requested intervals */
+        msg.sensor_id = SENSOR_BME680;
+        msg.timestamp_ms = esp_timer_get_time() / 1000;
+
+        esp_err_t read_result = bme680_read(&bme_data);
+        if (read_result == ESP_OK) {
+            msg.status = SENSOR_STATUS_OK;
+
+            /* Copy data from BME68x structure to sensor_data_t */
+            msg.data.bme.temperature = bme_data.temperature;
+            msg.data.bme.humidity = bme_data.humidity;
+            msg.data.bme.pressure = bme_data.pressure;
+            msg.data.bme.iaq = bme_data.iaq;
+            msg.data.bme.accuracy = bme_data.accuracy;
+            msg.data.bme.co2_equiv = bme_data.co2_equiv;
+            msg.data.bme.breath_voc = bme_data.breath_voc;
+
+            ESP_LOGI(TAG, "BME680: T=%.1f°C, H=%.1f%%, P=%.1fhPa, IAQ=%d (acc=%d), CO2=%dppm",
+                     bme_data.temperature, bme_data.humidity, bme_data.pressure,
+                     bme_data.iaq, bme_data.accuracy, bme_data.co2_equiv);
+
+            /* Send to queue */
+            if (xQueueSend(sensor_queue, &msg, 0) != pdTRUE) {
+                ESP_LOGW(TAG, "Sensor queue full, dropping BME680 reading");
+            }
+
+            /* Get next measurement time from BSEC */
+            next_call_ms = bme680_get_next_call_ms();
+            uint64_t now_ms = esp_timer_get_time() / 1000;
+            if (next_call_ms > now_ms) {
+                uint64_t wait_ms = next_call_ms - now_ms;
+                ESP_LOGD(TAG, "Next BSEC call in %llu ms", wait_ms);
+                vTaskDelay(pdMS_TO_TICKS(wait_ms));
+            } else {
+                /* Should not happen, but prevent tight loop */
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+        } else if (read_result == ESP_ERR_INVALID_STATE) {
+            /* Too early - wait a bit and retry */
+            vTaskDelay(pdMS_TO_TICKS(100));
+        } else {
+            ESP_LOGW(TAG, "BME680 read failed");
+            vTaskDelay(pdMS_TO_TICKS(1000));  /* Wait 1 sec on error */
+        }
+    }
+}
+#endif /* CONFIG_BME680_ENABLED */
+
+/* ======================== CAN Tasks ======================== */
+
+/* Helper function to get sensor flags */
+static uint8_t get_sensor_flags(void) {
+    uint8_t flags = 0;
+
+    /* Check ALS sensor */
+    if (als_get_sensor_name() != NULL) {
+        flags |= SENSOR_FLAG_ALS;
+    }
+
+#if defined(CONFIG_BME680_ENABLED) && BSEC_LIBRARY_AVAILABLE
+    flags |= SENSOR_FLAG_BME680;
+    if (bme680_is_bme688()) {
+        flags |= SENSOR_FLAG_BME688;
+    }
+#endif
+
+    return flags;
+}
+
+/* Helper function to get ALS type for CAN INFO_RESPONSE */
+static uint8_t get_als_type(void) {
+    const char *name = als_get_sensor_name();
+    if (name == NULL) return CAN_ALS_TYPE_NONE;
+
+    /* Check sensor name to determine type */
+    if (strstr(name, "VEML7700") != NULL) return CAN_ALS_TYPE_VEML7700;
+    if (strstr(name, "OPT4001") != NULL) return CAN_ALS_TYPE_OPT4001;
+    if (strstr(name, "OPT3001") != NULL) return CAN_ALS_TYPE_OPT3001;
+    return CAN_ALS_TYPE_NONE;
+}
+
+/* Helper function to get partition info byte */
+static uint8_t get_partition_info(void) {
+    uint8_t partition_type = PARTITION_TYPE_UNKNOWN;
+    uint8_t ota_state = OTA_IMG_STATE_UNDEFINED;
+
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (running) {
+        /* Determine partition type from subtype */
+        switch (running->subtype) {
+            case ESP_PARTITION_SUBTYPE_APP_FACTORY:
+                partition_type = PARTITION_TYPE_FACTORY;
+                break;
+            case ESP_PARTITION_SUBTYPE_APP_OTA_0:
+                partition_type = PARTITION_TYPE_OTA_0;
+                break;
+            case ESP_PARTITION_SUBTYPE_APP_OTA_1:
+                partition_type = PARTITION_TYPE_OTA_1;
+                break;
+            default:
+                partition_type = PARTITION_TYPE_UNKNOWN;
+                break;
+        }
+
+        /* Get OTA image state (only meaningful for OTA partitions) */
+        esp_ota_img_states_t img_state;
+        if (esp_ota_get_state_partition(running, &img_state) == ESP_OK) {
+            switch (img_state) {
+                case ESP_OTA_IMG_NEW:
+                    ota_state = OTA_IMG_STATE_NEW;
+                    break;
+                case ESP_OTA_IMG_PENDING_VERIFY:
+                    ota_state = OTA_IMG_STATE_PENDING;
+                    break;
+                case ESP_OTA_IMG_VALID:
+                    ota_state = OTA_IMG_STATE_VALID;
+                    break;
+                case ESP_OTA_IMG_INVALID:
+                    ota_state = OTA_IMG_STATE_INVALID;
+                    break;
+                case ESP_OTA_IMG_ABORTED:
+                    ota_state = OTA_IMG_STATE_ABORTED;
+                    break;
+                default:
+                    ota_state = OTA_IMG_STATE_UNDEFINED;
+                    break;
+            }
+        }
+    }
+
+    return PARTITION_INFO_PACK(partition_type, ota_state);
+}
+
+static void twai_receive_task(void *arg) {
+    twai_message_t rx_msg;
+    twai_message_t tx_msg;
+
+    /* Calculate our node's message IDs */
+    uint32_t my_stop_id     = CAN_MSG_ID(g_node_id, CAN_MSG_OFFSET_STOP);
+    uint32_t my_start_id    = CAN_MSG_ID(g_node_id, CAN_MSG_OFFSET_START);
+    uint32_t my_shutdown_id = CAN_MSG_ID(g_node_id, CAN_MSG_OFFSET_SHUTDOWN);
+    uint32_t my_reboot_id   = CAN_MSG_ID(g_node_id, CAN_MSG_OFFSET_REBOOT);
+    uint32_t my_factory_id  = CAN_MSG_ID(g_node_id, CAN_MSG_OFFSET_FACTORY_RST);
+    uint32_t my_setid_id    = CAN_MSG_ID(g_node_id, CAN_MSG_OFFSET_SET_NODE_ID);
+    uint32_t my_getinfo_id  = CAN_MSG_ID(g_node_id, CAN_MSG_OFFSET_GET_INFO);
+    uint32_t my_ping_id     = CAN_MSG_ID(g_node_id, CAN_MSG_OFFSET_PING);
+
+    ESP_LOGI(TAG, "TWAI receive task started (node %d, base 0x%03lX)",
+             g_node_id, (unsigned long)CAN_BASE_ADDR(g_node_id));
+
+    while (1) {
+        if (twai_receive(&rx_msg, portMAX_DELAY) == ESP_OK) {
+            uint32_t id = rx_msg.identifier;
+
+            /* Handle START/STOP/SHUTDOWN commands */
+            if (id == my_stop_id) {
+                ESP_LOGI(TAG, "Received STOP command");
+                g_tx_active = false;
+                xSemaphoreTake(done_sem, 0);  /* Clear if set */
+                xSemaphoreGive(done_sem);      /* Signal stop */
+
+            } else if (id == my_start_id) {
+                ESP_LOGI(TAG, "Received START command");
+                xSemaphoreTake(start_sem, 0);  /* Clear if set */
+                xSemaphoreGive(start_sem);      /* Signal start */
+
+            } else if (id == my_shutdown_id) {
+                /* Graceful shutdown: Save state, stop transmission, keep running */
+                ESP_LOGI(TAG, "Received SHUTDOWN command - saving state...");
+#if defined(CONFIG_BME680_ENABLED) && BSEC_LIBRARY_AVAILABLE
+                if (bme680_save_state() == ESP_OK) {
+                    ESP_LOGI(TAG, "BSEC calibration state saved successfully");
+                } else {
+                    ESP_LOGW(TAG, "Failed to save BSEC state");
+                }
+#endif
+                ESP_LOGI(TAG, "Ready for power-off (ESP32 still running)");
+                g_tx_active = false;
+                xSemaphoreTake(done_sem, 0);
+                xSemaphoreGive(done_sem);  /* Stop transmission */
+
+            } else if (id == my_reboot_id) {
+                /* Save state and reboot */
+                ESP_LOGI(TAG, "Received REBOOT command - saving state and rebooting...");
+#if defined(CONFIG_BME680_ENABLED) && BSEC_LIBRARY_AVAILABLE
+                bme680_save_state();  /* Save current calibration */
+#endif
+                vTaskDelay(pdMS_TO_TICKS(500));  /* Allow logs to flush */
+                esp_restart();  /* Reboot ESP32 */
+
+            } else if (id == my_factory_id) {
+                /* Factory reset: Clear calibration and node ID, then reboot */
+                ESP_LOGI(TAG, "Received FACTORY RESET command - clearing all config...");
+#if defined(CONFIG_BME680_ENABLED) && BSEC_LIBRARY_AVAILABLE
+                if (bme680_reset_calibration() == ESP_OK) {
+                    ESP_LOGI(TAG, "BSEC calibration cleared");
+                } else {
+                    ESP_LOGW(TAG, "Failed to clear BSEC calibration");
+                }
+#endif
+                /* Clear node ID (reset to 0) */
+                nvs_handle_t handle;
+                if (nvs_open(NVS_NAMESPACE_NODE, NVS_READWRITE, &handle) == ESP_OK) {
+                    nvs_erase_all(handle);
+                    nvs_commit(handle);
+                    nvs_close(handle);
+                    ESP_LOGI(TAG, "Node config cleared (will use default node ID 0)");
+                }
+                ESP_LOGI(TAG, "Rebooting to apply factory reset...");
+                vTaskDelay(pdMS_TO_TICKS(500));  /* Allow logs to flush */
+                esp_restart();  /* Reboot ESP32 */
+
+            } else if (id == my_setid_id) {
+                /* Set new node ID */
+                if (rx_msg.data_length_code >= 1) {
+                    uint8_t new_id = rx_msg.data[0];
+                    ESP_LOGI(TAG, "Received SET_NODE_ID command: %d -> %d", g_node_id, new_id);
+
+                    if (new_id > CAN_MAX_NODE_ID) {
+                        ESP_LOGW(TAG, "Invalid node ID %d (max %d), ignoring", new_id, CAN_MAX_NODE_ID);
+                    } else if (new_id == g_node_id) {
+                        ESP_LOGI(TAG, "Node ID unchanged, no reboot needed");
+                    } else {
+                        /* Save new node ID and reboot */
+                        if (save_node_id_to_nvs(new_id) == ESP_OK) {
+#if defined(CONFIG_BME680_ENABLED) && BSEC_LIBRARY_AVAILABLE
+                            bme680_save_state();  /* Save calibration before reboot */
+#endif
+                            ESP_LOGI(TAG, "Rebooting with new node ID %d...", new_id);
+                            vTaskDelay(pdMS_TO_TICKS(500));
+                            esp_restart();
+                        } else {
+                            ESP_LOGE(TAG, "Failed to save node ID, not rebooting");
+                        }
+                    }
+                }
+
+            } else if (id == my_getinfo_id) {
+                /* Respond with device info */
+                ESP_LOGI(TAG, "Received GET_INFO command");
+
+                uint8_t status_flags = g_tx_active ? STATUS_FLAG_TX_ACTIVE : 0;
+                uint8_t partition_info = get_partition_info();
+                can_format_info_response(g_node_id, get_sensor_flags(),
+                                         get_als_type(), status_flags,
+                                         partition_info, &tx_msg);
+
+                if (twai_transmit(&tx_msg, pdMS_TO_TICKS(100)) == ESP_OK) {
+                    ESP_LOGI(TAG, "Sent INFO_RESPONSE (node=%d, v%d.%d.%d, part=%d)",
+                             g_node_id, FIRMWARE_VERSION_MAJOR,
+                             FIRMWARE_VERSION_MINOR, FIRMWARE_VERSION_PATCH,
+                             PARTITION_INFO_TYPE(partition_info));
+                } else {
+                    ESP_LOGW(TAG, "Failed to send INFO_RESPONSE");
+                }
+
+            } else if (id == my_ping_id) {
+                /* Respond with PONG for discovery */
+                ESP_LOGD(TAG, "Received PING, sending PONG");
+                can_format_pong_response(g_node_id, &tx_msg);
+
+                if (twai_transmit(&tx_msg, pdMS_TO_TICKS(100)) != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to send PONG");
+                }
+
+            } else {
+                /* Check if this is an OTA message */
+                esp_err_t ota_result = ota_handler_process_message(&rx_msg);
+                if (ota_result == ESP_OK) {
+                    /* OTA message was handled */
+                    ESP_LOGD(TAG, "Processed OTA message");
+                }
+                /* If not OTA message (ESP_ERR_INVALID_ARG), ignore silently */
+            }
+        }
+    }
+}
+
+static void twai_transmit_task(void *arg) {
+    twai_message_t tx_msg;
+    sensor_data_t latest[NUM_SENSORS] = {0};
+    sensor_data_t incoming;
+    uint8_t sequence_counter = 0;
+    TickType_t xLastWakeTime;
+
+    ESP_LOGI(TAG, "TWAI transmit task started");
+
+    while (1) {
+        /* Wait for start command (blocking) */
+        xSemaphoreTake(start_sem, portMAX_DELAY);
 
         sequence_counter = 0;
         xLastWakeTime = xTaskGetTickCount();
+        g_tx_active = true;
+
+        ESP_LOGI(TAG, "Starting CAN transmission (node %d)", g_node_id);
 
         while (1) {
+            /* Check for stop command (non-blocking) */
             if (xSemaphoreTake(done_sem, 0) == pdTRUE) {
-                break;
+                ESP_LOGI(TAG, "Stopping CAN transmission");
+                g_tx_active = false;
+                break;  /* Exit inner loop, wait for next START */
             }
 
-            // Read lux with auto-ranging
-            esp_err_t lux_result = veml7700_read_lux_with_auto_ranging(&lux_value);
-            if (lux_result == ESP_OK) {
-                lux_int = (uint16_t)(lux_value > 65535.0 ? 65535 : lux_value);
-                sensor_status = 0x00;
-            } else {
-                lux_int = 0xFFFF;
-                sensor_status = 0x01;
+            /* Collect latest readings from queue (non-blocking) */
+            int queue_count = 0;
+            while (xQueueReceive(sensor_queue, &incoming, 0) == pdTRUE) {
+                latest[incoming.sensor_id] = incoming;
+                queue_count++;
+                ESP_LOGD(TAG, "Dequeued sensor %d: lux=%.1f",
+                         incoming.sensor_id, incoming.data.veml.lux);
             }
 
-            // Build message
-            memset(tx_msg.data, 0, 8);
-            tx_msg.data[0] = lux_int & 0xFF;
-            tx_msg.data[1] = (lux_int >> 8) & 0xFF;
-            tx_msg.data[2] = sensor_status;
-            tx_msg.data[3] = sequence_counter;
-            tx_msg.data[4] = current_config_idx;
-            tx_msg.data[5] = 0x00;
+            /* Transmit VEML7700/OPT4001 data (always present) */
+            can_format_veml7700_message(&latest[SENSOR_VEML7700],
+                                        sequence_counter,
+                                        &tx_msg);
+            /* Apply node ID offset to message ID */
+            can_set_msg_id(&tx_msg, g_node_id, CAN_MSG_OFFSET_ALS);
 
-            // Checksum
-            uint16_t checksum = 0;
-            for (int i = 0; i < 6; i++) {
-                checksum += tx_msg.data[i];
+            ESP_LOGD(TAG, "TX: lux=%.1f, seq=%d, queue_items=%d",
+                     latest[SENSOR_VEML7700].data.veml.lux, sequence_counter, queue_count);
+
+            if (twai_transmit(&tx_msg, pdMS_TO_TICKS(1000)) != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to transmit ALS message");
             }
-            tx_msg.data[6] = checksum & 0xFF;
-            tx_msg.data[7] = (checksum >> 8) & 0xFF;
 
-            twai_transmit(&tx_msg, pdMS_TO_TICKS(1000));
+#if defined(CONFIG_BME680_ENABLED) && BSEC_LIBRARY_AVAILABLE
+            /* Transmit BME680 environmental data (if available) */
+            if (latest[SENSOR_BME680].timestamp_ms > 0) {
+                can_format_bme_env_message(&latest[SENSOR_BME680], &tx_msg);
+                can_set_msg_id(&tx_msg, g_node_id, CAN_MSG_OFFSET_ENV);
+
+                if (twai_transmit(&tx_msg, pdMS_TO_TICKS(1000)) != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to transmit BME680 environmental message");
+                } else {
+                    ESP_LOGD(TAG, "TX BME ENV: T=%.1f°C, H=%.1f%%, P=%.1fhPa",
+                             latest[SENSOR_BME680].data.bme.temperature,
+                             latest[SENSOR_BME680].data.bme.humidity,
+                             latest[SENSOR_BME680].data.bme.pressure);
+                }
+
+                /* Transmit BME680 air quality data */
+                can_format_bme_aiq_message(&latest[SENSOR_BME680], &tx_msg);
+                can_set_msg_id(&tx_msg, g_node_id, CAN_MSG_OFFSET_AIQ);
+
+                if (twai_transmit(&tx_msg, pdMS_TO_TICKS(1000)) != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to transmit BME680 air quality message");
+                } else {
+                    ESP_LOGD(TAG, "TX BME AIQ: IAQ=%d, CO2=%d ppm, VOC=%d ppm",
+                             latest[SENSOR_BME680].data.bme.iaq,
+                             latest[SENSOR_BME680].data.bme.co2_equiv,
+                             latest[SENSOR_BME680].data.bme.breath_voc);
+                }
+            }
+#endif /* CONFIG_BME680_ENABLED */
+
             sequence_counter++;
 
+            /* Periodic delay (1 Hz) */
             vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(CAN_DATA_PERIOD_MS));
         }
     }
+}
 
+static void twai_control_task(void *arg) {
+    ESP_LOGI(TAG, "TWAI control task started");
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+#if AUTO_START_TX
+    /* Auto-start sensor transmission */
+    xSemaphoreGive(start_sem);
+    ESP_LOGI(TAG, "Auto-start: Enabled sensor transmission");
+#endif
+
+    /* Task done - delete itself */
     vTaskDelete(NULL);
 }
 
-static void twai_control_task(void *arg)
-{
-    twai_message_t tx_msg;
+/* ======================== Main Application ======================== */
 
-    tx_msg.identifier = ID_MASTER_START_CMD;
-    tx_msg.flags = TWAI_MSG_FLAG_NONE;
-    tx_msg.data_length_code = 0;
+void app_main(void) {
+    ESP_LOGI(TAG, "ESP32 CAN Node v%d.%d.%d starting...",
+             FIRMWARE_VERSION_MAJOR, FIRMWARE_VERSION_MINOR, FIRMWARE_VERSION_PATCH);
 
-    if (twai_transmit(&tx_msg, CAN_WAIT_FOREVER) == ESP_OK) {
-        xSemaphoreGive(start_sem);
+    /* Initialize NVS flash (required for calibration and node ID storage) */
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS partition needs erase, erasing...");
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+    ESP_LOGI(TAG, "NVS flash initialized");
+
+    /* Load node ID from NVS */
+    if (load_node_id_from_nvs(&g_node_id) == ESP_OK) {
+        ESP_LOGI(TAG, "Loaded node ID %d from NVS (base address 0x%03lX)",
+                 g_node_id, (unsigned long)CAN_BASE_ADDR(g_node_id));
+    } else {
+        ESP_LOGI(TAG, "Using default node ID %d (base address 0x%03lX)",
+                 g_node_id, (unsigned long)CAN_BASE_ADDR(g_node_id));
     }
 
-    vTaskDelete(NULL);
-}
+    /* Initialize OTA handler */
+    if (ota_handler_init(g_node_id) == ESP_OK) {
+        ESP_LOGI(TAG, "OTA handler initialized (CAN ID 0x%03lX)",
+                 (unsigned long)CAN_OTA_CMD_ID(g_node_id));
+        /* Mark firmware as valid to prevent rollback */
+        ota_handler_mark_valid();
+    } else {
+        ESP_LOGW(TAG, "OTA handler initialization failed");
+    }
 
-void app_main(void)
-{
-    // Create semaphores
+    /* Create semaphores */
     done_sem = xSemaphoreCreateBinary();
     start_sem = xSemaphoreCreateBinary();
 
@@ -597,16 +604,34 @@ void app_main(void)
         return;
     }
 
-    // Initialize I2C and VEML7700
-    ESP_ERROR_CHECK(i2c_master_init());
-    ESP_LOGI(TAG, "I2C initialized");
+    /* Create sensor queue */
+    sensor_queue = xQueueCreate(SENSOR_QUEUE_DEPTH, sizeof(sensor_data_t));
+    if (sensor_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create sensor queue");
+        return;
+    }
+    ESP_LOGI(TAG, "Sensor queue created (depth: %d)", SENSOR_QUEUE_DEPTH);
 
-    ESP_ERROR_CHECK(veml7700_init());
-    ESP_LOGI(TAG, "VEML7700 initialized with %s gain, %s integration",
-             sensor_config_gain_str(&g_configs[current_config_idx]),
-             sensor_config_it_str(&g_configs[current_config_idx]));
+    /* Initialize ambient light sensor (auto-detect VEML7700 or OPT4001) */
+    if (als_init() != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize ambient light sensor");
+        return;
+    }
+    ESP_LOGI(TAG, "Ambient light sensor (%s) initialized successfully", als_get_sensor_name());
 
-    // Configure TWAI
+#if defined(CONFIG_BME680_ENABLED) && BSEC_LIBRARY_AVAILABLE
+    /* Initialize BME680/BME688 environmental sensor */
+    if (bme680_init() == ESP_OK) {
+        ESP_LOGI(TAG, "BME680/688 (%s) initialized successfully (BSEC %s)",
+                 bme680_get_variant_name(), bme680_get_bsec_version());
+        ESP_LOGI(TAG, "BSEC calibration state age: %lu hours", bme680_get_state_age() / 3600);
+    } else {
+        ESP_LOGW(TAG, "BME680/688 not detected or initialization failed");
+        ESP_LOGW(TAG, "Continuing without BME680 support");
+    }
+#endif /* CONFIG_BME680_ENABLED */
+
+    /* Configure and start TWAI (CAN) */
     twai_general_config_t g_config = {
         .mode = TWAI_MODE_NORMAL,
         .tx_io = CAN_TX_GPIO_NUM,
@@ -622,31 +647,49 @@ void app_main(void)
     twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
     twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
-    // Install and start TWAI driver
-    ESP_ERROR_CHECK(twai_driver_install(&g_config, &t_config, &f_config));
-    ESP_ERROR_CHECK(twai_start());
-    ESP_LOGI(TAG, "TWAI initialized at 500kbps");
+    if (twai_driver_install(&g_config, &t_config, &f_config) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to install TWAI driver");
+        return;
+    }
 
-    // Create tasks
+    if (twai_start() != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start TWAI");
+        return;
+    }
+    ESP_LOGI(TAG, "TWAI initialized at 500 kbps");
+
+    /* Create tasks */
     xTaskCreate(twai_receive_task, "TWAI_RX", 3072, NULL, CAN_RX_TASK_PRIO, NULL);
-    xTaskCreate(twai_transmit_task, "TWAI_TX", 4096, NULL, CAN_TX_TASK_PRIO, NULL);
+    xTaskCreate(sensor_poll_task, "SENSOR_POLL", 3072, NULL, SENSOR_POLL_TASK_PRIO, NULL);
+
+#if defined(CONFIG_BME680_ENABLED) && BSEC_LIBRARY_AVAILABLE
+    xTaskCreate(bme680_sensor_task, "BME680_POLL", 10240, NULL, BME680_TASK_PRIO, NULL);
+    ESP_LOGI(TAG, "BME680 sensor task created (10KB stack for BSEC)");
+#endif
+
+    xTaskCreate(twai_transmit_task, "TWAI_TX", 5120, NULL, CAN_TX_TASK_PRIO, NULL);
     xTaskCreate(twai_control_task, "TWAI_CTRL", 2048, NULL, CAN_CTRL_TSK_PRIO, NULL);
 
-    ESP_LOGI(TAG, "ESP32-C6 CAN Lux Sensor with VEML7700 Auto-Ranging started");
-    ESP_LOGI(TAG, "Auto-ranging thresholds: OPTIMAL(%d-%d counts), TOO_LOW(%d), SATURATED(%d+)",
-             OPTIMAL_LOW, OPTIMAL_HIGH, TOO_LOW, SATURATED_HIGH);
+    ESP_LOGI(TAG, "All tasks created successfully");
+    ESP_LOGI(TAG, "System ready - sensor transmission will auto-start");
 
-    // Keep main task alive with periodic status
+    /* Main task: Periodic status logging and OTA timeout check */
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(10000)); // Log status every 10 seconds
+        vTaskDelay(pdMS_TO_TICKS(10000));  /* 10 second interval */
 
+        /* Check for OTA session timeout */
+        ota_handler_check_timeout();
+
+        /* Read current lux for status */
         float current_lux;
-        if (veml7700_read_lux_with_auto_ranging(&current_lux) == ESP_OK) {
-            ESP_LOGI(TAG, "Status: %.1f lux, Config: %d (%s gain, %s integration), Filter samples: %d, Config readings: %d",
-                     current_lux, current_config_idx,
-                     sensor_config_gain_str(&g_configs[current_config_idx]),
-                     sensor_config_it_str(&g_configs[current_config_idx]),
-                     lux_filter.count, range_state.readings_since_change);
+        if (als_read_lux(&current_lux) == ESP_OK) {
+            ESP_LOGI(TAG, "Status: %s, %.1f lux, Config: %d, Queue: %d/%d, Heap: %d KB",
+                     als_get_sensor_name(),
+                     current_lux,
+                     als_get_config_idx(),
+                     uxQueueMessagesWaiting(sensor_queue),
+                     SENSOR_QUEUE_DEPTH,
+                     esp_get_free_heap_size() / 1024);
         }
     }
 }

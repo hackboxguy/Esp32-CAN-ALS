@@ -1,0 +1,14 @@
+# Ignore BSEC proprietary library files
+# Users must download and setup BSEC themselves using setup_bsec.sh
+
+# Library files
+lib/
+include/
+src/
+
+# Keep these files in git
+!README.md
+!setup_bsec.sh
+!CMakeLists.txt
+!Kconfig
+!.gitignore
