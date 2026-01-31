@@ -29,8 +29,8 @@
 
 /* ======================== Configuration ======================== */
 
-#define CAN_TX_GPIO_NUM         GPIO_NUM_4
-#define CAN_RX_GPIO_NUM         GPIO_NUM_5
+#define CAN_TX_GPIO_NUM         GPIO_NUM_5
+#define CAN_RX_GPIO_NUM         GPIO_NUM_4
 
 #define CAN_TX_TASK_PRIO        8
 #define CAN_RX_TASK_PRIO        9
