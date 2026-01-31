@@ -61,7 +61,7 @@ static SemaphoreHandle_t start_sem;
 static QueueHandle_t sensor_queue;
 static bool g_tx_active = false;  /* Track if transmission is active */
 
-/* Node ID configuration (0-5, loaded from NVS) */
+/* Node ID configuration (0-15, loaded from NVS) */
 static uint8_t g_node_id = 0;
 
 /* ======================== NVS Node ID Functions ======================== */

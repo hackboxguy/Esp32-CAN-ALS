@@ -23,31 +23,43 @@
 
 /* ======================== Node ID Addressing ======================== */
 
-/* Each node has 16 message IDs reserved (0x10 spacing) */
-#define CAN_NODE_ADDR_SPACING   0x10
-#define CAN_BASE_ADDR_NODE_0    0x0A0
-#define CAN_MAX_NODE_ID         5
+/* Each node has 32 message IDs reserved (0x20 spacing) */
+#define CAN_NODE_ADDR_SPACING   0x20
+#define CAN_BASE_ADDR_NODE_0    0x100
+#define CAN_MAX_NODE_ID         15
 
 /* Calculate base address for a given node ID */
 #define CAN_BASE_ADDR(node_id)  (CAN_BASE_ADDR_NODE_0 + ((node_id) * CAN_NODE_ADDR_SPACING))
 
-/* Message offsets from node base address */
-#define CAN_MSG_OFFSET_STOP         0x00  /* Stop transmission */
-#define CAN_MSG_OFFSET_START        0x01  /* Start transmission */
-#define CAN_MSG_OFFSET_ALS          0x02  /* Ambient light data */
-#define CAN_MSG_OFFSET_ENV          0x03  /* Environmental data (T/H/P) */
-#define CAN_MSG_OFFSET_AIQ          0x04  /* Air quality (IAQ/CO2/VOC) */
-#define CAN_MSG_OFFSET_LD2410       0x05  /* Presence detection */
-#define CAN_MSG_OFFSET_MQ3          0x06  /* Alcohol/VOC */
-#define CAN_MSG_OFFSET_STATUS       0x07  /* System status */
-#define CAN_MSG_OFFSET_SHUTDOWN     0x08  /* Graceful shutdown */
-#define CAN_MSG_OFFSET_REBOOT       0x09  /* Reboot */
-#define CAN_MSG_OFFSET_FACTORY_RST  0x0A  /* Factory reset */
-#define CAN_MSG_OFFSET_SET_NODE_ID  0x0B  /* Set node ID */
-#define CAN_MSG_OFFSET_GET_INFO     0x0C  /* Request device info */
-#define CAN_MSG_OFFSET_INFO_RESP    0x0D  /* Device info response */
-#define CAN_MSG_OFFSET_PING         0x0E  /* Discovery ping */
-#define CAN_MSG_OFFSET_PONG         0x0F  /* Discovery response */
+/* ---- Sensor Data offsets (0x00-0x0F) ---- */
+#define CAN_MSG_OFFSET_ALS          0x00  /* Ambient light data */
+#define CAN_MSG_OFFSET_ENV          0x01  /* Environmental data (T/H/P) */
+#define CAN_MSG_OFFSET_AIQ          0x02  /* Air quality (IAQ/CO2/VOC) */
+#define CAN_MSG_OFFSET_GAS_1        0x03  /* BME688 selectivity gas class 1 */
+#define CAN_MSG_OFFSET_GAS_2        0x04  /* BME688 selectivity gas class 2 */
+#define CAN_MSG_OFFSET_GAS_3        0x05  /* BME688 selectivity gas class 3 */
+#define CAN_MSG_OFFSET_GAS_4        0x06  /* BME688 selectivity gas class 4 */
+#define CAN_MSG_OFFSET_PRESENCE     0x07  /* mm-wave presence detection */
+#define CAN_MSG_OFFSET_PRESENCE_EXT 0x08  /* Presence extended data */
+/* 0x09-0x0E reserved for future sensors */
+#define CAN_MSG_OFFSET_STATUS       0x0F  /* System status */
+
+/* ---- Control Command offsets (0x10-0x1F) ---- */
+#define CAN_MSG_OFFSET_STOP         0x10  /* Stop transmission */
+#define CAN_MSG_OFFSET_START        0x11  /* Start transmission */
+#define CAN_MSG_OFFSET_SHUTDOWN     0x12  /* Graceful shutdown */
+#define CAN_MSG_OFFSET_REBOOT       0x13  /* Reboot */
+#define CAN_MSG_OFFSET_FACTORY_RST  0x14  /* Factory reset */
+#define CAN_MSG_OFFSET_SET_NODE_ID  0x15  /* Set node ID */
+#define CAN_MSG_OFFSET_GET_INFO     0x16  /* Request device info */
+#define CAN_MSG_OFFSET_INFO_RESP    0x17  /* Device info response */
+#define CAN_MSG_OFFSET_PING         0x18  /* Discovery ping */
+#define CAN_MSG_OFFSET_PONG         0x19  /* Discovery response */
+/* 0x1A-0x1F reserved for future commands */
+
+/* Deprecated offset aliases (LD2410/MQ3 remapped to new offsets) */
+#define CAN_MSG_OFFSET_LD2410       CAN_MSG_OFFSET_PRESENCE
+#define CAN_MSG_OFFSET_MQ3          0x09  /* Reserved - MQ3 future slot */
 
 /* Calculate CAN ID for a given node and message type */
 #define CAN_MSG_ID(node_id, offset) (CAN_BASE_ADDR(node_id) + (offset))
@@ -55,26 +67,26 @@
 /* ======================== CAN Message IDs (Node 0 defaults) ======================== */
 
 /* Control Messages (RX - from master to ESP32) */
-#define ID_MASTER_STOP_CMD      0x0A0  /* Stop sensor transmission */
-#define ID_MASTER_START_CMD     0x0A1  /* Start sensor transmission */
-#define ID_MASTER_SHUTDOWN_CMD  0x0A8  /* Graceful shutdown (save state, keep running) */
-#define ID_MASTER_REBOOT_CMD    0x0A9  /* Save state and reboot ESP32 */
-#define ID_MASTER_FACTORY_RST   0x0AA  /* Factory reset (clear calibration, reboot) */
-#define ID_MASTER_SET_NODE_ID   0x0AB  /* Set node ID (triggers reboot) */
-#define ID_MASTER_GET_INFO      0x0AC  /* Request device info */
-#define ID_MASTER_PING          0x0AE  /* Discovery ping */
+#define ID_MASTER_STOP_CMD      CAN_MSG_ID(0, CAN_MSG_OFFSET_STOP)
+#define ID_MASTER_START_CMD     CAN_MSG_ID(0, CAN_MSG_OFFSET_START)
+#define ID_MASTER_SHUTDOWN_CMD  CAN_MSG_ID(0, CAN_MSG_OFFSET_SHUTDOWN)
+#define ID_MASTER_REBOOT_CMD    CAN_MSG_ID(0, CAN_MSG_OFFSET_REBOOT)
+#define ID_MASTER_FACTORY_RST   CAN_MSG_ID(0, CAN_MSG_OFFSET_FACTORY_RST)
+#define ID_MASTER_SET_NODE_ID   CAN_MSG_ID(0, CAN_MSG_OFFSET_SET_NODE_ID)
+#define ID_MASTER_GET_INFO      CAN_MSG_ID(0, CAN_MSG_OFFSET_GET_INFO)
+#define ID_MASTER_PING          CAN_MSG_ID(0, CAN_MSG_OFFSET_PING)
 
 /* Sensor Data Messages (TX - from ESP32 to master) */
-#define ID_SENSOR_VEML7700      0x0A2  /* Ambient light (1 Hz) */
-#define ID_SENSOR_BME_ENV       0x0A3  /* BME680/688 environmental (0.33 Hz) */
-#define ID_SENSOR_BME_AIQ       0x0A4  /* BME680/688 air quality (0.33 Hz) */
-#define ID_SENSOR_LD2410        0x0A5  /* Presence detection (10 Hz) */
-#define ID_SENSOR_MQ3           0x0A6  /* Alcohol/VOC (1 Hz) */
-#define ID_SENSOR_STATUS        0x0A7  /* System status (0.1 Hz) */
-#define ID_SENSOR_INFO_RESP     0x0AD  /* Device info response */
-#define ID_SENSOR_PONG          0x0AF  /* Discovery response */
+#define ID_SENSOR_VEML7700      CAN_MSG_ID(0, CAN_MSG_OFFSET_ALS)
+#define ID_SENSOR_BME_ENV       CAN_MSG_ID(0, CAN_MSG_OFFSET_ENV)
+#define ID_SENSOR_BME_AIQ       CAN_MSG_ID(0, CAN_MSG_OFFSET_AIQ)
+#define ID_SENSOR_LD2410        CAN_MSG_ID(0, CAN_MSG_OFFSET_PRESENCE)
+#define ID_SENSOR_MQ3           CAN_MSG_ID(0, CAN_MSG_OFFSET_MQ3)
+#define ID_SENSOR_STATUS        CAN_MSG_ID(0, CAN_MSG_OFFSET_STATUS)
+#define ID_SENSOR_INFO_RESP     CAN_MSG_ID(0, CAN_MSG_OFFSET_INFO_RESP)
+#define ID_SENSOR_PONG          CAN_MSG_ID(0, CAN_MSG_OFFSET_PONG)
 
-/* Legacy alias for backward compatibility */
+/* Legacy alias */
 #define ID_MASTER_DATA          ID_SENSOR_VEML7700
 
 /* ======================== Sensor Flags ======================== */
@@ -277,7 +289,7 @@ void can_format_status_message(uint8_t active_sensors, uint8_t free_heap_kb,
  *             Type: 0=factory, 1=ota_0, 2=ota_1, 7=unknown
  *             State: 0=undefined, 1=new, 2=pending, 3=valid, 4=invalid, 5=aborted
  *
- * @param[in] node_id Current node ID (0-5)
+ * @param[in] node_id Current node ID (0-15)
  * @param[in] sensor_flags Bitmask of detected sensors
  * @param[in] als_type ALS sensor type (ALS_TYPE_*)
  * @param[in] status_flags Current status flags
@@ -295,7 +307,7 @@ void can_format_info_response(uint8_t node_id, uint8_t sensor_flags,
  *   Byte 0:   Current node ID
  *   Byte 1-7: Reserved (0x00)
  *
- * @param[in] node_id Current node ID (0-5)
+ * @param[in] node_id Current node ID (0-15)
  * @param[out] msg CAN message to populate
  */
 void can_format_pong_response(uint8_t node_id, twai_message_t *msg);
@@ -307,7 +319,7 @@ void can_format_pong_response(uint8_t node_id, twai_message_t *msg);
  * node's address range.
  *
  * @param[in,out] msg CAN message to update
- * @param[in] node_id Node ID (0-5)
+ * @param[in] node_id Node ID (0-15)
  * @param[in] offset Message type offset (CAN_MSG_OFFSET_*)
  */
 void can_set_msg_id(twai_message_t *msg, uint8_t node_id, uint8_t offset);

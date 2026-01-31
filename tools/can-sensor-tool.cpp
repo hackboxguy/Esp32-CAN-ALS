@@ -49,27 +49,39 @@
 
 namespace can_protocol {
 
-// Node addressing: each node has 16 message IDs (0x10 spacing)
-constexpr uint32_t NODE_ADDR_SPACING = 0x10;
-constexpr uint32_t BASE_ADDR_NODE_0 = 0x0A0;
-constexpr int MAX_NODE_ID = 5;
+// Node addressing: each node has 32 message IDs (0x20 spacing)
+constexpr uint32_t NODE_ADDR_SPACING = 0x20;
+constexpr uint32_t BASE_ADDR_NODE_0 = 0x100;
+constexpr int MAX_NODE_ID = 15;
 
 // Message offsets from node base address
+// Sensor data: 0x00-0x0F, Control commands: 0x10-0x1F
 enum class MsgOffset : uint8_t {
-    STOP           = 0x00,  // Stop transmission
-    START          = 0x01,  // Start transmission
-    ALS_DATA       = 0x02,  // Ambient light sensor data
-    ENV_DATA       = 0x03,  // Environmental data (T/H/P)
-    AIR_QUALITY    = 0x04,  // Air quality (IAQ/CO2/VOC)
-    // 0x05-0x07 reserved for future sensors
-    SHUTDOWN       = 0x08,  // Graceful shutdown
-    REBOOT         = 0x09,  // Reboot
-    FACTORY_RESET  = 0x0A,  // Factory reset
-    SET_NODE_ID    = 0x0B,  // Set node ID
-    GET_INFO       = 0x0C,  // Request device info
-    INFO_RESPONSE  = 0x0D,  // Device info response
-    PING           = 0x0E,  // Discovery ping
-    PONG           = 0x0F,  // Discovery response
+    // Sensor data offsets (0x00-0x0F)
+    ALS_DATA       = 0x00,  // Ambient light sensor data
+    ENV_DATA       = 0x01,  // Environmental data (T/H/P)
+    AIR_QUALITY    = 0x02,  // Air quality (IAQ/CO2/VOC)
+    GAS_1          = 0x03,  // BME688 selectivity gas class 1
+    GAS_2          = 0x04,  // BME688 selectivity gas class 2
+    GAS_3          = 0x05,  // BME688 selectivity gas class 3
+    GAS_4          = 0x06,  // BME688 selectivity gas class 4
+    PRESENCE       = 0x07,  // mm-wave presence detection
+    PRESENCE_EXT   = 0x08,  // Presence extended data
+    // 0x09-0x0E reserved for future sensors
+    STATUS         = 0x0F,  // System status
+
+    // Control command offsets (0x10-0x1F)
+    STOP           = 0x10,  // Stop transmission
+    START          = 0x11,  // Start transmission
+    SHUTDOWN       = 0x12,  // Graceful shutdown
+    REBOOT         = 0x13,  // Reboot
+    FACTORY_RESET  = 0x14,  // Factory reset
+    SET_NODE_ID    = 0x15,  // Set node ID
+    GET_INFO       = 0x16,  // Request device info
+    INFO_RESPONSE  = 0x17,  // Device info response
+    PING           = 0x18,  // Discovery ping
+    PONG           = 0x19,  // Discovery response
+    // 0x1A-0x1F reserved for future commands
 };
 
 // Calculate CAN ID for a given node and message type
@@ -223,6 +235,7 @@ enum class Command {
     INFO,
     DISCOVER,
     UPDATE,
+    SANITY_TEST,
 };
 
 /* ============================================================================
@@ -460,6 +473,10 @@ void print_usage(const char* prog_name) {
     printf("      --verify-only     Just verify file CRC, no upload\n");
     printf("      --chunk-delay=<ms> Delay between chunks (default: %d)\n", ota_protocol::CHUNK_DELAY_MS);
     printf("\n");
+    printf("  Testing:\n");
+    printf("    sanity-test <file>  Run comprehensive device tests\n");
+    printf("                        (always targets node 0, continues on failure)\n");
+    printf("\n");
     printf("EXAMPLES:\n");
     printf("  %s monitor                        # Monitor node 0\n", prog_name);
     printf("  %s --node-id=1 reboot             # Reboot node 1\n", prog_name);
@@ -673,6 +690,13 @@ bool parse_args(int argc, char* argv[], Config& config) {
         config.command = Command::UPDATE;
         if (positional.size() < 2) {
             fprintf(stderr, "Error: update requires a firmware file argument\n");
+            return false;
+        }
+        config.firmware_file = positional[1];
+    } else if (cmd == "sanity-test") {
+        config.command = Command::SANITY_TEST;
+        if (positional.size() < 2) {
+            fprintf(stderr, "Error: sanity-test requires a firmware file argument\n");
             return false;
         }
         config.firmware_file = positional[1];
@@ -1320,9 +1344,9 @@ int cmd_discover(CanSocket& can, const Config& config) {
         can.send(ping_id);
     }
 
-    // Wait for PONG responses (300ms total)
+    // Wait for PONG responses (500ms total, enough for 16 nodes)
     auto start = std::chrono::steady_clock::now();
-    const int timeout_ms = 300;
+    const int timeout_ms = 500;
 
     while (true) {
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1702,6 +1726,505 @@ int cmd_update(CanSocket& can, const Config& config) {
 }
 
 /* ============================================================================
+ * Sanity Test Command
+ * ========================================================================== */
+
+struct TestResult {
+    std::string name;
+    bool passed;
+    std::string message;
+    int duration_ms;
+};
+
+/* ---- Sanity Test Helper Functions ---- */
+
+static bool verify_node_responds(CanSocket& can, int node_id, int timeout_ms) {
+    uint32_t ping_id = can_protocol::make_can_id(node_id, can_protocol::MsgOffset::PING);
+    uint32_t pong_id = can_protocol::make_can_id(node_id, can_protocol::MsgOffset::PONG);
+
+    if (!can.send(ping_id)) return false;
+
+    auto start = std::chrono::steady_clock::now();
+    while (true) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        if (elapsed >= timeout_ms) return false;
+
+        struct can_frame frame;
+        int remaining = timeout_ms - static_cast<int>(elapsed);
+        if (can.receive(frame, remaining)) {
+            if (frame.can_id == pong_id) return true;
+        }
+    }
+}
+
+static bool wait_for_node_ready(CanSocket& can, int node_id, int timeout_ms) {
+    uint32_t ping_id = can_protocol::make_can_id(node_id, can_protocol::MsgOffset::PING);
+    uint32_t pong_id = can_protocol::make_can_id(node_id, can_protocol::MsgOffset::PONG);
+
+    auto start = std::chrono::steady_clock::now();
+    while (true) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        if (elapsed >= timeout_ms) return false;
+
+        can.send(ping_id);
+
+        struct can_frame frame;
+        if (can.receive(frame, 200)) {
+            if (frame.can_id == pong_id) return true;
+        }
+        usleep(100000);  // 100ms between retries
+    }
+}
+
+static bool get_node_info(CanSocket& can, int node_id, InfoResponse& resp, int timeout_ms) {
+    uint32_t get_info_id = can_protocol::make_can_id(node_id, can_protocol::MsgOffset::GET_INFO);
+    uint32_t info_resp_id = can_protocol::make_can_id(node_id, can_protocol::MsgOffset::INFO_RESPONSE);
+
+    if (!can.send(get_info_id)) return false;
+
+    auto start = std::chrono::steady_clock::now();
+    while (true) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        if (elapsed >= timeout_ms) return false;
+
+        struct can_frame frame;
+        int remaining = timeout_ms - static_cast<int>(elapsed);
+        if (can.receive(frame, remaining)) {
+            if (frame.can_id == info_resp_id) {
+                return parse_info_response(frame, resp);
+            }
+        }
+    }
+}
+
+static int count_als_messages(CanSocket& can, int node_id, int duration_ms) {
+    uint32_t als_id = can_protocol::make_can_id(node_id, can_protocol::MsgOffset::ALS_DATA);
+    auto start = std::chrono::steady_clock::now();
+    int count = 0;
+
+    while (true) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        int remaining = duration_ms - static_cast<int>(elapsed);
+        if (remaining <= 0) break;
+
+        struct can_frame frame;
+        if (can.receive(frame, remaining)) {
+            if (frame.can_id == als_id) count++;
+        }
+    }
+    return count;
+}
+
+static int measure_als_interval(CanSocket& can, int node_id, int sample_duration_ms) {
+    uint32_t als_id = can_protocol::make_can_id(node_id, can_protocol::MsgOffset::ALS_DATA);
+    std::vector<std::chrono::steady_clock::time_point> timestamps;
+    auto start = std::chrono::steady_clock::now();
+
+    while (true) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        int remaining = sample_duration_ms - static_cast<int>(elapsed);
+        if (remaining <= 0) break;
+
+        struct can_frame frame;
+        if (can.receive(frame, remaining)) {
+            if (frame.can_id == als_id) {
+                timestamps.push_back(std::chrono::steady_clock::now());
+            }
+        }
+    }
+
+    if (timestamps.size() < 3) return -1;
+
+    int total_interval = 0;
+    for (size_t i = 1; i < timestamps.size(); i++) {
+        total_interval += static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            timestamps[i] - timestamps[i - 1]).count());
+    }
+    return total_interval / static_cast<int>(timestamps.size() - 1);
+}
+
+// Drain any pending CAN frames (call between tests to avoid stale data)
+static void drain_can_frames(CanSocket& can, int drain_ms = 50) {
+    struct can_frame frame;
+    auto start = std::chrono::steady_clock::now();
+    while (true) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        if (elapsed >= drain_ms) break;
+        can.receive(frame, 10);
+    }
+}
+
+/* ---- Individual Test Functions ---- */
+
+static TestResult test_discovery(CanSocket& can, int target_node) {
+    auto start = std::chrono::steady_clock::now();
+    bool ok = verify_node_responds(can, target_node, 500);
+    int dur = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count());
+
+    if (ok) return {"Discovery", true, "Node 0 responds to PING", dur};
+    return {"Discovery", false, "Node 0 did not respond to PING", dur};
+}
+
+static TestResult test_device_info(CanSocket& can, int target_node) {
+    auto start = std::chrono::steady_clock::now();
+    InfoResponse resp;
+    bool ok = get_node_info(can, target_node, resp, 500);
+    int dur = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count());
+
+    if (ok) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "FW v%d.%d.%d, sensors=0x%02X, ALS=%s, partition=%s (%s)",
+                 resp.fw_major, resp.fw_minor, resp.fw_patch,
+                 resp.sensor_flags, get_als_type_name(resp.als_type),
+                 get_partition_type_name(resp.partition_info),
+                 get_ota_state_name(resp.partition_info));
+        return {"Device Info", true, msg, dur};
+    }
+    return {"Device Info", false, "No INFO_RESPONSE received", dur};
+}
+
+static TestResult test_start_stop(CanSocket& can, int target_node) {
+    auto start = std::chrono::steady_clock::now();
+
+    // Send STOP first to ensure clean state
+    uint32_t stop_id = can_protocol::make_can_id(target_node, can_protocol::MsgOffset::STOP);
+    can.send(stop_id);
+    drain_can_frames(can, 200);
+
+    // Send START
+    uint32_t start_id = can_protocol::make_can_id(target_node, can_protocol::MsgOffset::START);
+    if (!can.send(start_id)) {
+        return {"Start/Stop", false, "Failed to send START", 0};
+    }
+    usleep(100000);  // 100ms settle
+
+    // Count ALS messages over 3 seconds
+    int msg_count = count_als_messages(can, target_node, 3000);
+
+    // Send STOP
+    can.send(stop_id);
+    usleep(200000);  // 200ms settle
+    drain_can_frames(can, 100);
+
+    // Verify silence for 1.5 seconds
+    int stopped_count = count_als_messages(can, target_node, 1500);
+
+    int dur = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count());
+
+    if (msg_count >= 2 && msg_count <= 5 && stopped_count == 0) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Received %d ALS msgs in 3s, 0 after STOP", msg_count);
+        return {"Start/Stop", true, msg, dur};
+    } else if (msg_count < 2) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Too few ALS messages: %d (expected 2-5)", msg_count);
+        return {"Start/Stop", false, msg, dur};
+    } else if (stopped_count > 0) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "%d messages received after STOP", stopped_count);
+        return {"Start/Stop", false, msg, dur};
+    }
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Unexpected count: %d msgs, %d after stop", msg_count, stopped_count);
+    return {"Start/Stop", false, msg, dur};
+}
+
+static TestResult test_monitor_interval(CanSocket& can, int target_node) {
+    auto start = std::chrono::steady_clock::now();
+
+    // Send START
+    uint32_t start_id = can_protocol::make_can_id(target_node, can_protocol::MsgOffset::START);
+    can.send(start_id);
+    usleep(100000);
+
+    // Measure interval over 5 seconds
+    int avg_interval = measure_als_interval(can, target_node, 5000);
+
+    // Send STOP
+    uint32_t stop_id = can_protocol::make_can_id(target_node, can_protocol::MsgOffset::STOP);
+    can.send(stop_id);
+    drain_can_frames(can, 200);
+
+    int dur = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count());
+
+    if (avg_interval < 0) {
+        return {"Monitor Interval", false, "Too few messages to measure interval", dur};
+    }
+    if (avg_interval >= 800 && avg_interval <= 1200) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Average interval: %d ms (target: 1000 ms)", avg_interval);
+        return {"Monitor Interval", true, msg, dur};
+    }
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Interval out of range: %d ms (expected 800-1200)", avg_interval);
+    return {"Monitor Interval", false, msg, dur};
+}
+
+static TestResult test_reboot(CanSocket& can, int target_node) {
+    auto start = std::chrono::steady_clock::now();
+
+    uint32_t reboot_id = can_protocol::make_can_id(target_node, can_protocol::MsgOffset::REBOOT);
+    if (!can.send(reboot_id)) {
+        return {"Reboot", false, "Failed to send REBOOT", 0};
+    }
+
+    // Wait a moment for reboot to start, then poll
+    usleep(500000);
+    bool recovered = wait_for_node_ready(can, target_node, 5000);
+
+    int dur = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count());
+
+    if (recovered) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Node rebooted and recovered in %d ms", dur);
+        return {"Reboot", true, msg, dur};
+    }
+    return {"Reboot", false, "Node did not respond after reboot (5s timeout)", dur};
+}
+
+static TestResult test_set_node_id(CanSocket& can, int target_node) {
+    auto start = std::chrono::steady_clock::now();
+
+    // Step 1: Change node 0 -> node 1
+    uint32_t set_id_cmd = can_protocol::make_can_id(0, can_protocol::MsgOffset::SET_NODE_ID);
+    uint8_t data[8] = {1, 0, 0, 0, 0, 0, 0, 0};
+    if (!can.send(set_id_cmd, data, 8)) {
+        return {"Set Node ID", false, "Failed to send SET_NODE_ID (0->1)", 0};
+    }
+
+    // Wait for reboot
+    usleep(500000);
+    if (!wait_for_node_ready(can, 1, 5000)) {
+        // Try to recover: node might still be at 0
+        return {"Set Node ID", false, "Node did not respond on ID 1 after change", 0};
+    }
+
+    // Verify node 1 reports correct ID
+    InfoResponse info1;
+    if (!get_node_info(can, 1, info1, 500) || info1.node_id != 1) {
+        // Try to change back anyway
+        uint32_t set_id_1 = can_protocol::make_can_id(1, can_protocol::MsgOffset::SET_NODE_ID);
+        data[0] = 0;
+        can.send(set_id_1, data, 8);
+        usleep(3000000);
+        return {"Set Node ID", false, "Node on ID 1 reported wrong node_id", 0};
+    }
+
+    // Step 2: Change node 1 -> node 0
+    uint32_t set_id_1 = can_protocol::make_can_id(1, can_protocol::MsgOffset::SET_NODE_ID);
+    data[0] = 0;
+    if (!can.send(set_id_1, data, 8)) {
+        return {"Set Node ID", false, "Failed to send SET_NODE_ID (1->0)", 0};
+    }
+
+    // Wait for reboot
+    usleep(500000);
+    if (!wait_for_node_ready(can, 0, 5000)) {
+        return {"Set Node ID", false, "Node did not respond on ID 0 after restore", 0};
+    }
+
+    // Verify node 0 reports correct ID
+    InfoResponse info0;
+    if (!get_node_info(can, 0, info0, 500) || info0.node_id != 0) {
+        return {"Set Node ID", false, "Node on ID 0 reported wrong node_id after restore", 0};
+    }
+
+    int dur = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count());
+    return {"Set Node ID", true, "Successfully changed 0->1->0", dur};
+}
+
+static TestResult test_factory_reset(CanSocket& can, int target_node) {
+    auto start = std::chrono::steady_clock::now();
+
+    uint32_t reset_id = can_protocol::make_can_id(target_node, can_protocol::MsgOffset::FACTORY_RESET);
+    if (!can.send(reset_id)) {
+        return {"Factory Reset", false, "Failed to send FACTORY_RESET", 0};
+    }
+
+    usleep(500000);
+    bool recovered = wait_for_node_ready(can, target_node, 5000);
+
+    int dur = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count());
+
+    if (recovered) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Factory reset completed in %d ms", dur);
+        return {"Factory Reset", true, msg, dur};
+    }
+    return {"Factory Reset", false, "Node did not respond after factory reset", dur};
+}
+
+static TestResult test_ota_update(CanSocket& can, int target_node, const std::string& firmware_file) {
+    auto start = std::chrono::steady_clock::now();
+
+    // Build a config for cmd_update
+    Config temp_config;
+    temp_config.interface = "can0";  // Not used (socket already open)
+    temp_config.node_id = target_node;
+    temp_config.firmware_file = firmware_file;
+    temp_config.no_activate = false;
+    temp_config.no_reboot = false;
+    temp_config.verify_only = false;
+    temp_config.chunk_delay_ms = ota_protocol::CHUNK_DELAY_MS;
+    temp_config.quiet = false;
+
+    int result = cmd_update(can, temp_config);
+
+    int dur = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count());
+
+    if (result != 0) {
+        return {"OTA Update", false, "OTA update failed", dur};
+    }
+
+    // Wait for node to boot with new firmware
+    usleep(2000000);  // 2 seconds
+    InfoResponse resp;
+    bool ok = get_node_info(can, target_node, resp, 2000);
+
+    dur = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count());
+
+    if (ok) {
+        float speed_kbps = 0;
+        // Estimate speed from file size and duration
+        std::ifstream f(firmware_file, std::ios::binary | std::ios::ate);
+        if (f.is_open()) {
+            size_t fsize = f.tellg();
+            f.close();
+            speed_kbps = (fsize / 1024.0f) / (dur / 1000.0f);
+        }
+        char msg[256];
+        snprintf(msg, sizeof(msg), "OTA OK, node booted v%d.%d.%d on %s (%.1f KB/s, %d ms)",
+                 resp.fw_major, resp.fw_minor, resp.fw_patch,
+                 get_partition_type_name(resp.partition_info),
+                 speed_kbps, dur);
+        return {"OTA Update", true, msg, dur};
+    }
+    return {"OTA Update", false, "Update succeeded but node did not respond after boot", dur};
+}
+
+static TestResult test_final_discovery(CanSocket& can, int target_node) {
+    auto start = std::chrono::steady_clock::now();
+    bool ok = verify_node_responds(can, target_node, 500);
+    int dur = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count());
+
+    if (ok) return {"Final Discovery", true, "Node 0 still responds after all tests", dur};
+    return {"Final Discovery", false, "Node 0 unresponsive after tests", dur};
+}
+
+/* ---- Sanity Test Orchestrator ---- */
+
+int cmd_sanity_test(CanSocket& can, const Config& config) {
+    const int TARGET_NODE = 0;
+    const int TOTAL_TESTS = 9;
+
+    fprintf(stderr, "========================================\n");
+    fprintf(stderr, "  CAN SENSOR NODE SANITY TEST\n");
+    fprintf(stderr, "========================================\n");
+    fprintf(stderr, "Target node: %d (base 0x%03X)\n", TARGET_NODE,
+            can_protocol::BASE_ADDR_NODE_0);
+    fprintf(stderr, "Firmware:    %s\n", config.firmware_file.c_str());
+    fprintf(stderr, "========================================\n\n");
+
+    std::vector<TestResult> results;
+    auto overall_start = std::chrono::steady_clock::now();
+
+    // Run all tests
+    auto run_test = [&](int num, const char* label, TestResult (*fn)(CanSocket&, int)) {
+        fprintf(stderr, "[%d/%d] %s...\n", num, TOTAL_TESTS, label);
+        results.push_back(fn(can, TARGET_NODE));
+        const auto& r = results.back();
+        fprintf(stderr, "       %s: %s\n\n",
+                r.passed ? "\033[32mPASS\033[0m" : "\033[31mFAIL\033[0m", r.message.c_str());
+        drain_can_frames(can);
+    };
+
+    run_test(1, "Discovery", test_discovery);
+    run_test(2, "Device Info", test_device_info);
+    run_test(3, "Start/Stop", test_start_stop);
+    run_test(4, "Monitor Interval", test_monitor_interval);
+    run_test(5, "Reboot", test_reboot);
+    run_test(6, "Set Node ID", test_set_node_id);
+    run_test(7, "Factory Reset", test_factory_reset);
+
+    // OTA test needs firmware file - different signature
+    fprintf(stderr, "[8/%d] OTA Update...\n", TOTAL_TESTS);
+    results.push_back(test_ota_update(can, TARGET_NODE, config.firmware_file));
+    {
+        const auto& r = results.back();
+        fprintf(stderr, "       %s: %s\n\n",
+                r.passed ? "\033[32mPASS\033[0m" : "\033[31mFAIL\033[0m", r.message.c_str());
+    }
+    drain_can_frames(can);
+
+    run_test(9, "Final Discovery", test_final_discovery);
+
+    // Calculate summary
+    auto overall_end = std::chrono::steady_clock::now();
+    int total_ms = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        overall_end - overall_start).count());
+    int passed = 0, failed = 0;
+    for (const auto& r : results) {
+        if (r.passed) passed++; else failed++;
+    }
+
+    // Print summary
+    fprintf(stderr, "========================================\n");
+    fprintf(stderr, "  TEST SUMMARY\n");
+    fprintf(stderr, "========================================\n");
+    for (size_t i = 0; i < results.size(); i++) {
+        const auto& r = results[i];
+        fprintf(stderr, "  [%zu] %-20s %s  (%d ms)\n",
+                i + 1, r.name.c_str(),
+                r.passed ? "\033[32mPASS\033[0m" : "\033[31mFAIL\033[0m", r.duration_ms);
+        if (!r.passed) {
+            fprintf(stderr, "      -> %s\n", r.message.c_str());
+        }
+    }
+    fprintf(stderr, "========================================\n");
+    fprintf(stderr, "  Results: %d/%d passed, %d failed\n", passed, TOTAL_TESTS, failed);
+    fprintf(stderr, "  Total time: %.1f seconds\n", total_ms / 1000.0f);
+    fprintf(stderr, "========================================\n");
+
+    // Cleanup: ensure node ID is back to 0
+    InfoResponse cleanup_info;
+    if (get_node_info(can, 0, cleanup_info, 500) && cleanup_info.node_id == 0) {
+        // Already at node 0, nothing to do
+    } else {
+        fprintf(stderr, "\n  Cleanup: Restoring node ID to 0...\n");
+        // Try sending SET_NODE_ID=0 to nodes 0-15
+        for (int n = 0; n < 16; n++) {
+            uint32_t cmd = can_protocol::make_can_id(n, can_protocol::MsgOffset::SET_NODE_ID);
+            uint8_t data[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+            can.send(cmd, data, 8);
+        }
+        usleep(500000);
+        if (wait_for_node_ready(can, 0, 5000)) {
+            fprintf(stderr, "  Cleanup: Node ID restored to 0\n");
+        } else {
+            fprintf(stderr, "  \033[31mCleanup: WARNING - Failed to restore node ID to 0!\033[0m\n");
+        }
+    }
+
+    return (failed > 0) ? 1 : 0;
+}
+
+/* ============================================================================
  * Main
  * ========================================================================== */
 
@@ -1738,7 +2261,7 @@ int main(int argc, char* argv[]) {
 
     info("Connected to %s (node %d, base address 0x%03X)\n",
          config.interface.c_str(), config.node_id,
-         can_protocol::make_can_id(config.node_id, can_protocol::MsgOffset::STOP));
+         can_protocol::BASE_ADDR_NODE_0 + config.node_id * can_protocol::NODE_ADDR_SPACING);
 
     // Execute command
     int result = 0;
@@ -1772,6 +2295,9 @@ int main(int argc, char* argv[]) {
             break;
         case Command::UPDATE:
             result = cmd_update(can, config);
+            break;
+        case Command::SANITY_TEST:
+            result = cmd_sanity_test(can, config);
             break;
         default:
             fprintf(stderr, "Error: No command specified\n");

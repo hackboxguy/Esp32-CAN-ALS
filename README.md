@@ -11,7 +11,7 @@ This project implements a multi-sensor node for automotive CAN networks using:
   - **Environmental:** BME680/BME688 (temperature, humidity, pressure, air quality)
 - **TJA1050 CAN transceiver** for robust automotive communication
 - **A/B OTA firmware updates** over CAN bus (~3 KB/s)
-- **Multi-node support** with configurable node IDs (0-5)
+- **Multi-node support** with configurable node IDs (0-15)
 
 ## Features
 
@@ -20,7 +20,7 @@ This project implements a multi-sensor node for automotive CAN networks using:
   - OPT4001: 0-2.2M lux, factory calibrated
   - BME680/BME688: Temperature, humidity, pressure, IAQ/CO2/VOC
 - **A/B firmware updates** over CAN bus with rollback support
-- **Multi-node addressing** (up to 6 nodes on same CAN bus)
+- **Multi-node addressing** (up to 16 nodes on same CAN bus)
 - **Comprehensive node management** via can-sensor-tool:
   - Device discovery and monitoring
   - Remote reboot and factory reset
@@ -274,56 +274,65 @@ Device Info (Node 0):
 For basic control without can-sensor-tool:
 ```bash
 # Start/Stop transmission (Node 0)
-cansend can0 0A1#        # Start
-cansend can0 0A0#        # Stop
+cansend can0 111#        # Start
+cansend can0 110#        # Stop
 
 # Graceful shutdown (saves state)
-cansend can0 0A8#
+cansend can0 112#
 
 # Reboot (saves state and reboots)
-cansend can0 0A9#
+cansend can0 113#
 
 # Factory reset
-cansend can0 0AA#
+cansend can0 114#
 ```
 
 ## CAN Protocol
 
 ### Node Addressing
 
-Each node has 16 message IDs reserved (0x10 spacing):
+Each node has 32 message IDs reserved (0x20 spacing), supporting up to 16 nodes:
 
-| Node ID | Base Address | Sensor Data | OTA Commands |
-|---------|--------------|-------------|--------------|
-| 0 | 0x0A0 | 0x0A2-0x0A7 | 0x700/0x708 |
-| 1 | 0x0B0 | 0x0B2-0x0B7 | 0x710/0x718 |
-| 2 | 0x0C0 | 0x0C2-0x0C7 | 0x720/0x728 |
-| 3 | 0x0D0 | 0x0D2-0x0D7 | 0x730/0x738 |
-| 4 | 0x0E0 | 0x0E2-0x0E7 | 0x740/0x748 |
-| 5 | 0x0F0 | 0x0F2-0x0F7 | 0x750/0x758 |
+| Node ID | Base Address | Sensor Data | Control Cmds | OTA Commands |
+|---------|--------------|-------------|--------------|--------------|
+| 0 | 0x100 | 0x100-0x10F | 0x110-0x11F | 0x700/0x708 |
+| 1 | 0x120 | 0x120-0x12F | 0x130-0x13F | 0x710/0x718 |
+| 2 | 0x140 | 0x140-0x14F | 0x150-0x15F | 0x720/0x728 |
+| ... | ... | ... | ... | ... |
+| 15 | 0x2E0 | 0x2E0-0x2EF | 0x2F0-0x2FF | 0x7F0/0x7F8 |
 
 ### Message Types (Node 0 Example)
 
+**Sensor Data (offsets 0x00-0x0F):**
+
 | ID | Direction | Purpose | Rate |
 |----|-----------|---------|------|
-| 0x0A0 | PC → ESP32 | Stop transmission | - |
-| 0x0A1 | PC → ESP32 | Start transmission | - |
-| 0x0A2 | ESP32 → PC | Ambient light data | 1 Hz |
-| 0x0A3 | ESP32 → PC | Environmental (T/H/P) | 0.33 Hz |
-| 0x0A4 | ESP32 → PC | Air quality (IAQ/CO2/VOC) | 0.33 Hz |
-| 0x0A7 | ESP32 → PC | System status | 0.1 Hz |
-| 0x0A8 | PC → ESP32 | Graceful shutdown | - |
-| 0x0A9 | PC → ESP32 | Reboot | - |
-| 0x0AA | PC → ESP32 | Factory reset | - |
-| 0x0AB | PC → ESP32 | Set node ID | - |
-| 0x0AC | PC → ESP32 | Get device info | - |
-| 0x0AD | ESP32 → PC | Device info response | - |
-| 0x0AE | PC → ESP32 | Discovery ping | - |
-| 0x0AF | ESP32 → PC | Discovery pong | - |
+| 0x100 | ESP32 → PC | Ambient light data | 1 Hz |
+| 0x101 | ESP32 → PC | Environmental (T/H/P) | 0.33 Hz |
+| 0x102 | ESP32 → PC | Air quality (IAQ/CO2/VOC) | 0.33 Hz |
+| 0x103-0x106 | ESP32 → PC | BME688 gas selectivity (classes 1-4) | Future |
+| 0x107 | ESP32 → PC | mm-wave presence detection | Future |
+| 0x108 | ESP32 → PC | Presence extended data | Future |
+| 0x10F | ESP32 → PC | System status | 0.1 Hz |
+
+**Control Commands (offsets 0x10-0x1F):**
+
+| ID | Direction | Purpose |
+|----|-----------|---------|
+| 0x110 | PC → ESP32 | Stop transmission |
+| 0x111 | PC → ESP32 | Start transmission |
+| 0x112 | PC → ESP32 | Graceful shutdown |
+| 0x113 | PC → ESP32 | Reboot |
+| 0x114 | PC → ESP32 | Factory reset |
+| 0x115 | PC → ESP32 | Set node ID |
+| 0x116 | PC → ESP32 | Get device info |
+| 0x117 | ESP32 → PC | Device info response |
+| 0x118 | PC → ESP32 | Discovery ping |
+| 0x119 | ESP32 → PC | Discovery pong |
 
 ### Message Formats
 
-#### Ambient Light (0x0A2)
+#### Ambient Light (offset 0x00)
 ```
 Byte 0-2: Lux value (24-bit LE, 0-16.7M lux)
 Byte 3:   Status (0x00=OK, 0x01=Error)
@@ -332,7 +341,7 @@ Byte 5:   Config index (0-20=VEML7700, 100-111=OPT4001)
 Byte 6-7: Checksum (16-bit LE)
 ```
 
-#### Environmental (0x0A3)
+#### Environmental (offset 0x01)
 ```
 Byte 0-1: Temperature (int16_t, 0.01°C)
 Byte 2:   Humidity (%RH)
@@ -341,7 +350,7 @@ Byte 5:   Status
 Byte 6-7: Checksum
 ```
 
-#### Air Quality (0x0A4)
+#### Air Quality (offset 0x02)
 ```
 Byte 0-1: IAQ index (0-500)
 Byte 2:   IAQ accuracy (0-3)
@@ -350,7 +359,7 @@ Byte 5-6: Breath VOC (ppm)
 Byte 7:   Status
 ```
 
-#### Device Info Response (0x0AD)
+#### Device Info Response (offset 0x17)
 ```
 Byte 0:   Node ID
 Byte 1:   Firmware major version
@@ -406,7 +415,7 @@ Esp32-CAN-ALS/
 - **Firmware Size:** ~302-345 KB (15-17% of partition)
 - **OTA Partition Size:** ~1.94 MB each (A/B slots)
 - **RAM Usage:** ~90 KB
-- **Max Nodes:** 6 (IDs 0-5)
+- **Max Nodes:** 16 (IDs 0-15)
 
 ## Troubleshooting
 

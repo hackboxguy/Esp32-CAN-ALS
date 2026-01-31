@@ -56,12 +56,12 @@ sudo ip link set can0 up
 # Monitor messages
 candump can0 -L
 
-# Control commands
-cansend can0 0A1#        # Start transmission
-cansend can0 0A0#        # Stop transmission
-cansend can0 0A8#        # Graceful shutdown (save state)
-cansend can0 0A9#        # Reboot ESP32 (save state first)
-cansend can0 0AA#        # Factory reset (clear calibration)
+# Control commands (Node 0)
+cansend can0 111#        # Start transmission
+cansend can0 110#        # Stop transmission
+cansend can0 112#        # Graceful shutdown (save state)
+cansend can0 113#        # Reboot ESP32 (save state first)
+cansend can0 114#        # Factory reset (clear calibration)
 ```
 
 ### Testing
@@ -74,22 +74,22 @@ idf.py monitor
 candump can0 -t z
 
 # Test basic functionality
-cansend can0 0A1#        # Start transmission
+cansend can0 111#        # Start transmission (Node 0)
 # Should see:
-#   0x0A2 @ 1 Hz (ambient light - VEML7700 or OPT4001)
-#   0x0A3 @ 0.33 Hz (BME680 environmental - T/H/P)
-#   0x0A4 @ 0.33 Hz (BME680 air quality - IAQ/CO2/VOC)
+#   0x100 @ 1 Hz (ambient light - VEML7700 or OPT4001)
+#   0x101 @ 0.33 Hz (BME680 environmental - T/H/P)
+#   0x102 @ 0.33 Hz (BME680 air quality - IAQ/CO2/VOC)
 
 # Test graceful shutdown
-cansend can0 0A8#        # Shutdown (saves BSEC state)
+cansend can0 112#        # Shutdown (saves BSEC state)
 # Wait for "BSEC state saved to NVS" message
 
 # Test reboot with state persistence
-cansend can0 0A9#        # Reboot (saves and reboots)
+cansend can0 113#        # Reboot (saves and reboots)
 # Watch for IAQ accuracy to persist after reboot
 
 # Test factory reset
-cansend can0 0AA#        # Factory reset
+cansend can0 114#        # Factory reset
 # IAQ accuracy should return to 0 after reboot
 ```
 
@@ -290,7 +290,7 @@ The firmware supports BME680/BME688 environmental sensors with **runtime auto-de
 - Auto-saves BSEC calibration state every 4 hours
 - Persists across reboots for faster IAQ convergence
 - State includes gas sensor baseline and calibration history
-- CAN command 0x0A8/0x0A9 triggers immediate save
+- CAN command 0x112/0x113 triggers immediate save
 
 **IAQ Calibration Timeline:**
 - **Accuracy 0:** Uncalibrated (first 5 minutes)
@@ -320,19 +320,27 @@ The firmware supports BME680/BME688 environmental sensors with **runtime auto-de
 
 ### CAN Protocol
 
-**Control Messages (RX - from master to ESP32):**
-- `0x0A0`: STOP - Stop sensor transmission
-- `0x0A1`: START - Start sensor transmission (auto-start at boot if no CAN activity)
-- `0x0A8`: SHUTDOWN - Graceful shutdown (save BSEC state, stop TX, keep ESP32 running)
-- `0x0A9`: REBOOT - Save BSEC state and reboot ESP32
-- `0x0AA`: FACTORY_RESET - Clear BSEC calibration (factory default) and reboot
+**Node Addressing:**
+- Base address: 0x100, spacing: 0x20 (32 IDs per node), max 16 nodes (0-15)
+- Sensor data offsets: 0x00-0x0F, Control command offsets: 0x10-0x1F
+- OTA: 0x700 base, 0x10 spacing (unchanged)
 
-**Data Messages (TX - from ESP32 to master):**
-- `0x0A2`: Ambient light data (1 Hz, VEML7700 or OPT4001)
-- `0x0A3`: BME680 environmental data (0.33 Hz, T/H/P)
-- `0x0A4`: BME680 air quality data (0.33 Hz, IAQ/CO2/VOC)
+**Control Messages (RX - from master to ESP32, Node 0 example):**
+- `0x110`: STOP - Stop sensor transmission
+- `0x111`: START - Start sensor transmission (auto-start at boot if no CAN activity)
+- `0x112`: SHUTDOWN - Graceful shutdown (save BSEC state, stop TX, keep ESP32 running)
+- `0x113`: REBOOT - Save BSEC state and reboot ESP32
+- `0x114`: FACTORY_RESET - Clear BSEC calibration (factory default) and reboot
 
-**Message Format 0x0A2 (Ambient Light):**
+**Data Messages (TX - from ESP32 to master, Node 0 example):**
+- `0x100`: Ambient light data (1 Hz, VEML7700 or OPT4001)
+- `0x101`: BME680 environmental data (0.33 Hz, T/H/P)
+- `0x102`: BME680 air quality data (0.33 Hz, IAQ/CO2/VOC)
+- `0x103-0x106`: BME688 gas selectivity classes 1-4 (future)
+- `0x107-0x108`: mm-wave presence detection (future)
+- `0x10F`: System status
+
+**Message Format offset 0x00 (Ambient Light):**
 ```
 Byte 0-2: Lux value (uint24_t, little-endian, 0-16,777,215)
 Byte 3:   Status (0x00=OK, 0x01=Error)
@@ -341,7 +349,7 @@ Byte 5:   Config index (0-20=VEML7700, 100-111=OPT4001)
 Byte 6-7: Checksum (sum of bytes 0-5, uint16_t LE)
 ```
 
-**Message Format 0x0A3 (Environmental - T/H/P):**
+**Message Format offset 0x01 (Environmental - T/H/P):**
 ```
 Byte 0-1: Temperature (int16_t, 0.1°C resolution, -40.0 to 85.0°C)
 Byte 2-3: Humidity (uint16_t, 0.1% resolution, 0.0 to 100.0%)
@@ -350,7 +358,7 @@ Byte 6:   Reserved (0x00)
 Byte 7:   Status (0x00=OK, 0x01=Error)
 ```
 
-**Message Format 0x0A4 (Air Quality - IAQ/CO2/VOC):**
+**Message Format offset 0x02 (Air Quality - IAQ/CO2/VOC):**
 ```
 Byte 0-1: IAQ (uint16_t, 0-500 index)
 Byte 2:   IAQ Accuracy (uint8_t, 0-3: 0=uncalibrated, 3=fully calibrated)
@@ -361,19 +369,19 @@ Byte 7:   Status (0x00=OK, 0x01=Error)
 
 **Control Command Usage Examples:**
 ```bash
-# Normal operation control
-cansend can0 0A1#              # Start transmission
-cansend can0 0A0#              # Stop transmission
+# Normal operation control (Node 0)
+cansend can0 111#              # Start transmission
+cansend can0 110#              # Stop transmission
 
 # Graceful shutdown before power-off
-cansend can0 0A8#              # Save calibration, stop TX
+cansend can0 112#              # Save calibration, stop TX
 # (wait for "BSEC state saved" message, then safe to power off)
 
 # Reboot ESP32 (preserves calibration)
-cansend can0 0A9#              # Save state and reboot
+cansend can0 113#              # Save state and reboot
 
 # Factory reset (clear calibration)
-cansend can0 0AA#              # Reset to factory defaults, reboot
+cansend can0 114#              # Reset to factory defaults, reboot
 ```
 
 ### Pin Assignments
@@ -410,7 +418,7 @@ GPIO7:  I2C SCL (Shared bus for all I2C sensors)
 1. **Auto-ranging changes:** Test across full dynamic range (0-120,000 lux)
    - Verify no oscillation between configs
    - Check settling time is adequate
-   - Monitor with: `candump can0 | grep 0A2`
+   - Monitor with: `candump can0 | grep 100`
 
 2. **Configuration table:** Maintain order (most sensitive → least sensitive)
    - Index 0: Highest gain/longest integration (2x/800ms)
@@ -475,7 +483,7 @@ GPIO7:  I2C SCL (Shared bus for all I2C sensors)
    - IAQ accuracy 2 = medium accuracy (30+ minutes) - good for most applications
    - IAQ accuracy 3 = high accuracy (hours to days) - fully calibrated baseline
    - State persists in NVS, so don't clear NVS during testing
-   - Use CAN command 0x0A8 or 0x0A9 to save state before power-off
+   - Use CAN command 0x112 or 0x113 to save state before power-off
 
 6. **Stack size is critical**
    - BME680 task requires 10KB stack minimum
@@ -574,7 +582,7 @@ See `EXPANSION_GUIDE.md` for detailed multi-sensor expansion plan (BME680, LD241
 - Check if NVS flash is initialized in app_main()
 - Must call `nvs_flash_init()` before sensor init
 - Verify "BSEC state saved to NVS" message appears every 4 hours
-- Use CAN command 0x0A9 to test save/reboot cycle
+- Use CAN command 0x113 to test save/reboot cycle
 
 **BME680 gas measurements timeout:**
 - Check measurement completion time (should be ~1140ms)
@@ -616,13 +624,13 @@ See `EXPANSION_GUIDE.md` for detailed multi-sensor expansion plan (BME680, LD241
 - [ ] No oscillation between configs
 - [ ] Smooth transitions: indoor (500 lux) → outdoor (70K lux)
 - [ ] Calibration accuracy vs reference meter (indoor and sunlight)
-- [ ] Config index 0-20 reported correctly in CAN messages (0x0A2)
+- [ ] Config index 0-20 reported correctly in CAN messages (offset 0x00)
 
 ### Integration Testing - OPT4001
 - [ ] Hardware auto-ranging across 0-2.2M lux
 - [ ] Accuracy vs reference meter: ±2% at 100 lux, 1K lux, 10K+ lux
 - [ ] Range transitions smooth (config 100-111)
-- [ ] Config index 100-111 reported correctly in CAN messages (0x0A2)
+- [ ] Config index 100-111 reported correctly in CAN messages (offset 0x00)
 - [ ] No stack overflow with powf() usage
 
 ### Integration Testing - BME680
@@ -632,17 +640,17 @@ See `EXPANSION_GUIDE.md` for detailed multi-sensor expansion plan (BME680, LD241
 - [ ] T/H/P values reasonable (T: room temp ±1.5°C, H: 20-80%, P: 980-1030 hPa)
 - [ ] IAQ calibration progresses (accuracy 0→1→2→3 over time)
 - [ ] CO2 and VOC values update (not stuck at 500/0.5)
-- [ ] Environmental data CAN messages (0x0A3) at 0.33 Hz
-- [ ] Air quality CAN messages (0x0A4) at 0.33 Hz
+- [ ] Environmental data CAN messages (offset 0x01) at 0.33 Hz
+- [ ] Air quality CAN messages (offset 0x02) at 0.33 Hz
 - [ ] NVS state save every 4 hours
-- [ ] Calibration persists across reboot (test with 0x0A9 command)
+- [ ] Calibration persists across reboot (test with reboot command, offset 0x13)
 
 ### Integration Testing - CAN Commands
-- [ ] START command (0x0A1) - transmission begins
-- [ ] STOP command (0x0A0) - transmission stops
-- [ ] SHUTDOWN command (0x0A8) - state saved, TX stops, ESP32 keeps running
-- [ ] REBOOT command (0x0A9) - state saved, ESP32 reboots, calibration restored
-- [ ] FACTORY_RESET command (0x0AA) - calibration cleared, IAQ accuracy returns to 0
+- [ ] START command (offset 0x11) - transmission begins
+- [ ] STOP command (offset 0x10) - transmission stops
+- [ ] SHUTDOWN command (offset 0x12) - state saved, TX stops, ESP32 keeps running
+- [ ] REBOOT command (offset 0x13) - state saved, ESP32 reboots, calibration restored
+- [ ] FACTORY_RESET command (offset 0x14) - calibration cleared, IAQ accuracy returns to 0
 
 ### Integration Testing - Multi-Sensor
 - [ ] All sensors coexist on shared I2C bus
@@ -714,8 +722,8 @@ The codebase has been refactored with a **modular, queue-based architecture** re
 - ✅ Added BME680/BME688 environmental sensor with BSEC 2.6.1.0
 - ✅ Full IAQ mode with 8 virtual sensor outputs
 - ✅ NVS state persistence for calibration
-- ✅ CAN messages 0x0A3 (T/H/P) and 0x0A4 (IAQ/CO2/VOC)
-- ✅ Graceful shutdown commands (0x0A8, 0x0A9, 0x0AA)
+- ✅ CAN messages for T/H/P (offset 0x01) and IAQ/CO2/VOC (offset 0x02)
+- ✅ Graceful shutdown commands (offsets 0x12, 0x13, 0x14)
 
 **Next Phases (Planned):**
 - Phase 2: Add HLK-LD2410 human presence radar (UART)
@@ -725,6 +733,6 @@ The codebase has been refactored with a **modular, queue-based architecture** re
 See `EXPANSION_GUIDE.md` for detailed implementation plans including:
 - Hardware pin assignments
 - Resource budgets (SRAM, Flash, CPU)
-- Extended CAN protocol (0x0A3-0x0A7)
+- Extended CAN protocol (offsets 0x00-0x0F sensor data, 0x10-0x1F control)
 - Task coordination strategies
 - Testing procedures
