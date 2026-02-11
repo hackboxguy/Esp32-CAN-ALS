@@ -86,7 +86,7 @@ can-sensor-tool --all monitor                  # Dashboard with all nodes
 can-sensor-tool --all info                     # Show info for all nodes
 can-sensor-tool --all identify                 # Blink LED on all nodes
 can-sensor-tool --nodes=0,2 reboot             # Reboot specific nodes
-can-sensor-tool --all update firmware.bin      # OTA update all nodes sequentially
+can-sensor-tool --all update firmware.bin      # OTA update all nodes (with partition verification)
 ```
 
 ### Calibration Utility (C++)
@@ -449,6 +449,8 @@ OTA_1:   0x210000 (~1.94MB) - Firmware slot B
 - CRC32 verification of complete firmware image
 - Transfer speed: ~3 KB/s
 - Session timeout: 5 minutes, max 3 retries per chunk
+- Partition switch verification after reboot (pre/post info query)
+- Batch update waits for each node to reboot before proceeding to next
 - Use `can-sensor-tool update firmware.bin` for managed updates
 
 ### CAN Protocol
@@ -766,6 +768,12 @@ See `EXPANSION_GUIDE.md` for detailed multi-sensor expansion plan (BME680, LD241
 - Verify firmware binary size fits in partition (~1.94 MB max)
 - Check for OTA session timeout (5 min idle = abort)
 
+**OTA partition unchanged after update:**
+- Update summary shows "partition unchanged (ota_X)" = firmware didn't activate
+- Check if firmware calls `esp_ota_mark_app_valid()` on boot
+- Bootloader may have rolled back to previous slot (3 failed boot attempts)
+- Verify firmware CRC matches: tool checks CRC32 before activating
+
 **Node not discovered by can-sensor-tool:**
 - Verify CAN interface is up: `ip link show can0`
 - Check node ID hasn't been changed: try `can-sensor-tool --node=N ping` for N=0-15
@@ -835,6 +843,9 @@ See `EXPANSION_GUIDE.md` for detailed multi-sensor expansion plan (BME680, LD241
 ### Integration Testing - OTA
 - [ ] OTA update via can-sensor-tool: `can-sensor-tool update firmware.bin`
 - [ ] Partition alternates between OTA_0 and OTA_1
+- [ ] Partition switch verified automatically (pre/post info query)
+- [ ] Batch OTA: `can-sensor-tool --all update firmware.bin` (sequential, wait for reboot)
+- [ ] Batch OTA summary shows partition transitions per node
 - [ ] Automatic rollback on corrupted firmware
 - [ ] OTA session timeout after 5 minutes of inactivity
 - [ ] CRC32 verification rejects corrupted images

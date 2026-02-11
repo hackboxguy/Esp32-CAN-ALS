@@ -217,7 +217,7 @@ can-sensor-tool --all reboot
 can-sensor-tool --nodes=0,2 identify
 can-sensor-tool --nodes=0,1,2 reboot
 
-# OTA update all nodes (sequential, continues on failure)
+# OTA update all nodes (sequential, with partition verification)
 can-sensor-tool --all update firmware.bin
 ```
 
@@ -263,6 +263,8 @@ can-sensor-tool --chunk-delay=5 update ./build/esp32-can-sensor.bin
 - Progress display with ETA
 - Automatic retry with exponential backoff
 - Safe: keeps old firmware until new one is validated
+- Partition switch verification: confirms node booted from new partition after update
+- Batch update waits for each node to reboot before proceeding to next
 
 ### A/B OTA Update Mechanism
 
@@ -294,24 +296,42 @@ Flash Layout (4MB):
 - If firmware crashes before validation, bootloader reverts to previous slot
 - After 3 failed boot attempts, automatically rolls back
 
-**Example OTA session:**
+**Example OTA session (single node):**
 ```bash
-# Check current partition
-$ can-sensor-tool info
-Device Info (Node 0):
-  Firmware:    v1.0.1
-  Partition:   ota_0 (valid)     # Currently running from OTA_0
-
-# Perform OTA update
 $ can-sensor-tool update ./build/esp32-can-sensor.bin
-Uploading: [==============================] 100% (345040/345040) 3.3 KB/s
+Current partition: ota_0
+Uploading: [==============================] 100% (334704/334704) 3.6 KB/s
 Update complete! Node 0 is rebooting to new firmware.
+Waiting for node 0 to reboot...
+Node 0 back online (3.6s)
+Partition switched: ota_0 -> ota_1 (v1.0.2)
 
-# Verify - now on OTA_1
-$ can-sensor-tool info
-Device Info (Node 0):
-  Firmware:    v1.0.1
-  Partition:   ota_1 (valid)     # Now running from OTA_1
+--- OTA Update Summary ---
+  Node 0: OK (ota_0 -> ota_1 (v1.0.2))
+  Total: 1/1 succeeded
+```
+
+**Example batch OTA (all nodes):**
+```bash
+$ can-sensor-tool --all update ./build/esp32-can-sensor.bin
+Discovering nodes on can0...
+Found 3 node(s): 0 1 2
+
+--- OTA Update: Node 0 (1/3) ---
+Current partition: ota_1
+Uploading: [==============================] 100% 3.6 KB/s
+Waiting for node 0 to reboot...
+Node 0 back online (3.6s)
+Partition switched: ota_1 -> ota_0 (v1.0.2)
+
+--- OTA Update: Node 1 (2/3) ---
+...
+
+--- OTA Update Summary ---
+  Node 0: OK (ota_1 -> ota_0 (v1.0.2))
+  Node 1: OK (ota_1 -> ota_0 (v1.0.2))
+  Node 2: OK (ota_0 -> ota_1 (v1.0.2))
+  Total: 3/3 succeeded
 ```
 
 ### Direct CAN Commands
@@ -484,6 +504,11 @@ Esp32-CAN-ALS/
 - Ensure node is responding: `can-sensor-tool ping`
 - Try with longer chunk delay: `can-sensor-tool --chunk-delay=10 update firmware.bin`
 - Check for CAN bus errors: `ip -s link show can0`
+
+**OTA partition unchanged after update:**
+- Summary shows "partition unchanged (ota_X)" = firmware didn't activate on new partition
+- Check if firmware calls `esp_ota_mark_app_valid()` on boot
+- Bootloader may have rolled back after 3 failed boot attempts
 
 **IAQ readings stuck at defaults:**
 - BME680 needs calibration time (5+ minutes for accuracy > 0)

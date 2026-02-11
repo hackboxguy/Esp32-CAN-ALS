@@ -1528,43 +1528,41 @@ int cmd_set_node_id(CanSocket& can, const Config& config) {
  * Info Command
  * ========================================================================== */
 
-int cmd_info(CanSocket& can, const Config& config) {
-    uint32_t get_info_id = can_protocol::make_can_id(config.node_id, can_protocol::MsgOffset::GET_INFO);
-    uint32_t info_resp_id = can_protocol::make_can_id(config.node_id, can_protocol::MsgOffset::INFO_RESPONSE);
+// Query device info without printing. Returns true on success.
+static bool query_device_info(CanSocket& can, int node_id, InfoResponse& resp, int timeout_ms = 500) {
+    uint32_t get_info_id = can_protocol::make_can_id(node_id, can_protocol::MsgOffset::GET_INFO);
+    uint32_t info_resp_id = can_protocol::make_can_id(node_id, can_protocol::MsgOffset::INFO_RESPONSE);
 
-    info("Querying node %d info (CAN ID 0x%03X)...\n", config.node_id, get_info_id);
+    if (!can.send(get_info_id)) return false;
 
-    // Send GET_INFO request
-    if (!can.send(get_info_id)) {
-        fprintf(stderr, "Error: Failed to send GET_INFO command\n");
-        return 1;
-    }
-
-    // Wait for INFO_RESPONSE (500ms timeout)
-    struct can_frame frame;
     auto start = std::chrono::steady_clock::now();
-    const int timeout_ms = 500;
-
     while (true) {
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start).count();
+        if (elapsed >= timeout_ms) return false;
 
-        if (elapsed >= timeout_ms) {
-            fprintf(stderr, "Error: No response from node %d (timeout)\n", config.node_id);
-            return 1;
-        }
-
+        struct can_frame frame;
         int remaining = timeout_ms - static_cast<int>(elapsed);
         if (can.receive(frame, remaining)) {
             if (frame.can_id == info_resp_id) {
-                InfoResponse resp;
-                if (parse_info_response(frame, resp)) {
-                    print_info_response(resp, config.format);
-                    return 0;
-                }
+                return parse_info_response(frame, resp);
             }
         }
     }
+}
+
+int cmd_info(CanSocket& can, const Config& config) {
+    info("Querying node %d info (CAN ID 0x%03X)...\n", config.node_id,
+         can_protocol::make_can_id(config.node_id, can_protocol::MsgOffset::GET_INFO));
+
+    InfoResponse resp;
+    if (!query_device_info(can, config.node_id, resp)) {
+        fprintf(stderr, "Error: No response from node %d (timeout)\n", config.node_id);
+        return 1;
+    }
+
+    print_info_response(resp, config.format);
+    return 0;
 }
 
 /* ============================================================================
@@ -2526,17 +2524,78 @@ int dispatch_update(CanSocket& can, const Config& config,
     struct UpdateResult {
         int node_id;
         bool success;
+        std::string detail;  // e.g. "ota_0 -> ota_1" or failure reason
     };
     std::vector<UpdateResult> results;
 
-    for (int node : nodes) {
-        info("\n--- OTA Update: Node %d ---\n", node);
+    for (size_t i = 0; i < nodes.size(); i++) {
+        int node = nodes[i];
+        info("\n--- OTA Update: Node %d (%zu/%zu) ---\n", node, i + 1, nodes.size());
+
+        // Query partition before update
+        InfoResponse pre_info;
+        uint8_t pre_partition = PARTITION_TYPE_UNKNOWN;
+        if (query_device_info(can, node, pre_info)) {
+            pre_partition = pre_info.partition_info & 0x07;
+            info("Current partition: %s\n", get_partition_type_name(pre_info.partition_info));
+        } else {
+            info("Warning: Could not query pre-update partition info\n");
+        }
+
         Config node_config = config;
         node_config.node_id = node;
         int rc = cmd_update(can, node_config);
-        results.push_back({node, rc == 0});
+
         if (rc != 0) {
+            results.push_back({node, false, "upload failed"});
             fprintf(stderr, "Warning: OTA update failed for node %d, continuing...\n", node);
+            continue;
+        }
+
+        // Wait for node to reboot and come back online
+        info("Waiting for node %d to reboot...\n", node);
+        auto reboot_start = std::chrono::steady_clock::now();
+        usleep(2000000);  // 2s initial delay for ESP32 to enter reboot
+
+        if (!wait_for_node_ready(can, node, 18000)) {
+            results.push_back({node, false, "no response after reboot"});
+            fprintf(stderr, "Warning: Node %d did not respond after reboot (20s timeout)\n", node);
+            continue;
+        }
+
+        auto reboot_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - reboot_start).count();
+        info("Node %d back online (%.1fs)\n", node, reboot_elapsed / 1000.0);
+
+        // Verify partition switched after reboot
+        InfoResponse post_info;
+        if (query_device_info(can, node, post_info)) {
+            uint8_t post_partition = post_info.partition_info & 0x07;
+            const char* pre_name = get_partition_type_name(pre_info.partition_info);
+            const char* post_name = get_partition_type_name(post_info.partition_info);
+
+            if (pre_partition != PARTITION_TYPE_UNKNOWN && pre_partition == post_partition) {
+                // Partition didn't change — update failed
+                char detail[64];
+                snprintf(detail, sizeof(detail), "partition unchanged (%s)", post_name);
+                results.push_back({node, false, detail});
+                fprintf(stderr, "Error: Node %d partition did not switch (%s -> %s), update FAILED\n",
+                        node, pre_name, post_name);
+            } else {
+                char detail[64];
+                snprintf(detail, sizeof(detail), "%s -> %s (v%d.%d.%d)",
+                         pre_name, post_name,
+                         post_info.fw_major, post_info.fw_minor, post_info.fw_patch);
+                results.push_back({node, true, detail});
+                info("Partition switched: %s -> %s (v%d.%d.%d)\n",
+                     pre_name, post_name,
+                     post_info.fw_major, post_info.fw_minor, post_info.fw_patch);
+            }
+        } else {
+            // Node responded to ping but not to info query — treat as success
+            // (partition verification not possible)
+            results.push_back({node, true, "verified (ping only)"});
+            info("Warning: Could not verify partition switch (info query failed)\n");
         }
     }
 
@@ -2545,10 +2604,10 @@ int dispatch_update(CanSocket& can, const Config& config,
     int passed = 0, failed = 0;
     for (const auto& r : results) {
         if (r.success) {
-            info("  Node %d: OK\n", r.node_id);
+            info("  Node %d: OK (%s)\n", r.node_id, r.detail.c_str());
             passed++;
         } else {
-            fprintf(stderr, "  Node %d: FAILED\n", r.node_id);
+            fprintf(stderr, "  Node %d: FAILED (%s)\n", r.node_id, r.detail.c_str());
             failed++;
         }
     }
