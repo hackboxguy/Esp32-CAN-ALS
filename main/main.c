@@ -15,6 +15,7 @@
 #include <esp_ota_ops.h>
 #include <nvs_flash.h>
 #include <driver/twai.h>
+#include <driver/gpio.h>
 
 #include "firmware_config.h"
 #include "can_protocol.h"
@@ -63,6 +64,73 @@ static bool g_tx_active = false;  /* Track if transmission is active */
 
 /* Node ID configuration (0-15, loaded from NVS) */
 static uint8_t g_node_id = 0;
+
+/* ======================== Identify LED Blink ======================== */
+
+#define IDENTIFY_GPIO           GPIO_NUM_8
+#define IDENTIFY_BLINK_PERIOD_US (100 * 1000)   /* 100ms toggle = 5 Hz blink */
+#define IDENTIFY_DURATION_US    (5000 * 1000)    /* 5 seconds total */
+
+static esp_timer_handle_t identify_blink_timer = NULL;
+static esp_timer_handle_t identify_stop_timer = NULL;
+static bool identify_gpio_initialized = false;
+
+static void identify_blink_cb(void *arg) {
+    static bool led_on = false;
+    led_on = !led_on;
+    gpio_set_level(IDENTIFY_GPIO, led_on ? 0 : 1);  /* Active-low: 0 = ON */
+}
+
+static void identify_stop_cb(void *arg) {
+    if (identify_blink_timer) {
+        esp_timer_stop(identify_blink_timer);
+    }
+    gpio_set_level(IDENTIFY_GPIO, 1);  /* LED off (active-low) */
+    ESP_LOGI(TAG, "Identify LED blink finished");
+}
+
+static void identify_start(void) {
+    /* Initialize GPIO on first use */
+    if (!identify_gpio_initialized) {
+        gpio_reset_pin(IDENTIFY_GPIO);
+        gpio_set_direction(IDENTIFY_GPIO, GPIO_MODE_OUTPUT);
+        gpio_set_level(IDENTIFY_GPIO, 1);  /* LED off initially */
+        identify_gpio_initialized = true;
+    }
+
+    /* Stop any existing blink cycle (re-trigger support) */
+    if (identify_blink_timer) {
+        esp_timer_stop(identify_blink_timer);
+        esp_timer_delete(identify_blink_timer);
+        identify_blink_timer = NULL;
+    }
+    if (identify_stop_timer) {
+        esp_timer_stop(identify_stop_timer);
+        esp_timer_delete(identify_stop_timer);
+        identify_stop_timer = NULL;
+    }
+
+    /* Create and start periodic blink timer */
+    const esp_timer_create_args_t blink_args = {
+        .callback = identify_blink_cb,
+        .name = "identify_blink"
+    };
+    esp_timer_create(&blink_args, &identify_blink_timer);
+    esp_timer_start_periodic(identify_blink_timer, IDENTIFY_BLINK_PERIOD_US);
+
+    /* Create and start one-shot stop timer */
+    const esp_timer_create_args_t stop_args = {
+        .callback = identify_stop_cb,
+        .name = "identify_stop"
+    };
+    esp_timer_create(&stop_args, &identify_stop_timer);
+    esp_timer_start_once(identify_stop_timer, IDENTIFY_DURATION_US);
+
+    /* Turn LED on immediately for first blink */
+    gpio_set_level(IDENTIFY_GPIO, 0);  /* Active-low: 0 = ON */
+
+    ESP_LOGI(TAG, "Identify LED blink started (5 seconds)");
+}
 
 /* ======================== NVS Node ID Functions ======================== */
 
@@ -325,6 +393,7 @@ static void twai_receive_task(void *arg) {
     uint32_t my_setid_id    = CAN_MSG_ID(g_node_id, CAN_MSG_OFFSET_SET_NODE_ID);
     uint32_t my_getinfo_id  = CAN_MSG_ID(g_node_id, CAN_MSG_OFFSET_GET_INFO);
     uint32_t my_ping_id     = CAN_MSG_ID(g_node_id, CAN_MSG_OFFSET_PING);
+    uint32_t my_identify_id = CAN_MSG_ID(g_node_id, CAN_MSG_OFFSET_IDENTIFY);
 
     ESP_LOGI(TAG, "TWAI receive task started (node %d, base 0x%03lX)",
              g_node_id, (unsigned long)CAN_BASE_ADDR(g_node_id));
@@ -443,6 +512,11 @@ static void twai_receive_task(void *arg) {
                 if (twai_transmit(&tx_msg, pdMS_TO_TICKS(100)) != ESP_OK) {
                     ESP_LOGW(TAG, "Failed to send PONG");
                 }
+
+            } else if (id == my_identify_id) {
+                /* Blink onboard LED for physical identification */
+                ESP_LOGI(TAG, "Received IDENTIFY command - blinking LED");
+                identify_start();
 
             } else {
                 /* Check if this is an OTA message */

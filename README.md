@@ -213,6 +213,9 @@ can-sensor-tool reboot
 # Factory reset (clears calibration)
 can-sensor-tool factory-reset
 
+# Identify node (blink onboard LED for 5 seconds)
+can-sensor-tool identify
+
 # Change node ID (0-5)
 can-sensor-tool set-id 2
 
@@ -305,6 +308,9 @@ cansend can0 113#
 
 # Factory reset
 cansend can0 114#
+
+# Identify (blink LED for 5 seconds)
+cansend can0 11A#
 ```
 
 ## CAN Protocol

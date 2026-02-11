@@ -76,6 +76,8 @@ can-sensor-tool stop                           # Stop sensor transmission
 can-sensor-tool reboot                         # Reboot node (saves calibration)
 can-sensor-tool factory-reset                  # Factory reset (clears calibration)
 can-sensor-tool set-id 2                       # Change node ID
+can-sensor-tool identify                       # Blink onboard LED for 5 seconds
+can-sensor-tool --node=2 identify              # Identify specific node
 can-sensor-tool update ./build/esp32-can-sensor.bin  # OTA firmware update
 ```
 
@@ -110,6 +112,7 @@ cansend can0 110#        # Stop transmission
 cansend can0 112#        # Graceful shutdown (save state)
 cansend can0 113#        # Reboot ESP32 (save state first)
 cansend can0 114#        # Factory reset (clear calibration)
+cansend can0 11A#        # Identify (blink LED for 5 seconds)
 ```
 
 ### Testing
@@ -456,6 +459,7 @@ OTA_1:   0x210000 (~1.94MB) - Firmware slot B
 - `0x115`: SET_NODE_ID - Change node ID (byte 0 = new ID, 0-15)
 - `0x116`: GET_DEVICE_INFO - Request device info
 - `0x118`: DISCOVERY_PING - Ping for device discovery
+- `0x11A`: IDENTIFY - Blink onboard LED for 5 seconds (GPIO8, active-low)
 
 **Response Messages (TX - from ESP32 to master, Node 0 example):**
 - `0x117`: DEVICE_INFO_RESPONSE - Firmware version, sensor flags, partition info
@@ -523,6 +527,9 @@ cansend can0 113#              # Save state and reboot
 
 # Factory reset (clear calibration)
 cansend can0 114#              # Reset to factory defaults, reboot
+
+# Identify node (blink LED)
+cansend can0 11A#              # Blink onboard LED for 5 seconds
 ```
 
 ### Pin Assignments
@@ -532,6 +539,7 @@ GPIO4:  CAN TX
 GPIO5:  CAN RX
 GPIO6:  I2C SDA (Shared bus for all I2C sensors)
 GPIO7:  I2C SCL (Shared bus for all I2C sensors)
+GPIO8:  Onboard LED (active-low, used for identify blink)
 ```
 
 **I2C Bus Sharing:**
@@ -813,6 +821,8 @@ See `EXPANSION_GUIDE.md` for detailed multi-sensor expansion plan (BME680, LD241
 - [ ] SET_NODE_ID command (offset 0x15) - node ID changes and persists in NVS
 - [ ] GET_DEVICE_INFO command (offset 0x16) - returns firmware version and sensor flags
 - [ ] DISCOVERY_PING command (offset 0x18) - node responds with pong
+- [ ] IDENTIFY command (offset 0x1A) - onboard LED blinks for 5 seconds
+- [ ] IDENTIFY re-trigger - sending again restarts the 5-second timer
 
 ### Integration Testing - OTA
 - [ ] OTA update via can-sensor-tool: `can-sensor-tool update firmware.bin`

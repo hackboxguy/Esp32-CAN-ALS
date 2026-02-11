@@ -55,7 +55,8 @@
 #define CAN_MSG_OFFSET_INFO_RESP    0x17  /* Device info response */
 #define CAN_MSG_OFFSET_PING         0x18  /* Discovery ping */
 #define CAN_MSG_OFFSET_PONG         0x19  /* Discovery response */
-/* 0x1A-0x1F reserved for future commands */
+#define CAN_MSG_OFFSET_IDENTIFY     0x1A  /* Identify (blink LED) */
+/* 0x1B-0x1F reserved for future commands */
 
 /* Deprecated offset aliases (LD2410/MQ3 remapped to new offsets) */
 #define CAN_MSG_OFFSET_LD2410       CAN_MSG_OFFSET_PRESENCE

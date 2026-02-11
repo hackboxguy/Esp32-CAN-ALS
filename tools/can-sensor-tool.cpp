@@ -81,7 +81,8 @@ enum class MsgOffset : uint8_t {
     INFO_RESPONSE  = 0x17,  // Device info response
     PING           = 0x18,  // Discovery ping
     PONG           = 0x19,  // Discovery response
-    // 0x1A-0x1F reserved for future commands
+    IDENTIFY       = 0x1A,  // Identify (blink LED)
+    // 0x1B-0x1F reserved for future commands
 };
 
 // Calculate CAN ID for a given node and message type
@@ -236,6 +237,7 @@ enum class Command {
     DISCOVER,
     UPDATE,
     SANITY_TEST,
+    IDENTIFY,
 };
 
 /* ============================================================================
@@ -454,6 +456,7 @@ void print_usage(const char* prog_name) {
     printf("    shutdown            Graceful shutdown (save state, stop TX)\n");
     printf("    reboot              Save state and reboot device\n");
     printf("    factory-reset       Clear calibration and reboot\n");
+    printf("    identify            Blink onboard LED for 5 seconds\n");
     printf("\n");
     printf("  Monitoring:\n");
     printf("    monitor             Display live sensor data\n");
@@ -700,6 +703,8 @@ bool parse_args(int argc, char* argv[], Config& config) {
             return false;
         }
         config.firmware_file = positional[1];
+    } else if (cmd == "identify") {
+        config.command = Command::IDENTIFY;
     } else {
         fprintf(stderr, "Error: Unknown command: %s\n", cmd.c_str());
         return false;
@@ -774,6 +779,19 @@ int cmd_factory_reset(CanSocket& can, const Config& config) {
     }
 
     info("FACTORY_RESET command sent successfully\n");
+    return 0;
+}
+
+int cmd_identify(CanSocket& can, const Config& config) {
+    uint32_t can_id = can_protocol::make_can_id(config.node_id, can_protocol::MsgOffset::IDENTIFY);
+    info("Sending IDENTIFY to node %d (CAN ID 0x%03X)...\n", config.node_id, can_id);
+
+    if (!can.send(can_id)) {
+        fprintf(stderr, "Error: Failed to send IDENTIFY command\n");
+        return 1;
+    }
+
+    info("IDENTIFY command sent - node %d LED will blink for 5 seconds\n", config.node_id);
     return 0;
 }
 
@@ -2298,6 +2316,9 @@ int main(int argc, char* argv[]) {
             break;
         case Command::SANITY_TEST:
             result = cmd_sanity_test(can, config);
+            break;
+        case Command::IDENTIFY:
+            result = cmd_identify(can, config);
             break;
         default:
             fprintf(stderr, "Error: No command specified\n");
