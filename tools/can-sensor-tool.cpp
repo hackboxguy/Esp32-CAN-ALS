@@ -17,6 +17,10 @@
 #include <vector>
 #include <optional>
 #include <chrono>
+#include <algorithm>
+#include <sstream>
+#include <set>
+#include <map>
 
 #include <fstream>
 
@@ -249,6 +253,8 @@ struct Config {
     std::string interface = "can0";
     int speed = 500000;  // For reference only (interface must be pre-configured)
     int node_id = 0;
+    bool target_all = false;            // --all flag
+    std::vector<int> target_nodes;      // --nodes=0,1,2
     bool quiet = false;
 
     // Command
@@ -258,6 +264,7 @@ struct Config {
     OutputFormat format = OutputFormat::HUMAN;
     int count = 0;      // 0 = unlimited
     int timeout = 0;    // 0 = unlimited (seconds)
+    bool verbose = false;  // --verbose: scrolling output instead of dashboard
 
     // Set node ID option
     int new_node_id = -1;
@@ -445,6 +452,8 @@ void print_usage(const char* prog_name) {
     printf("  --interface=<iface>   CAN interface (default: can0)\n");
     printf("  --speed=<bps>         CAN speed in bps (default: 500000, for reference)\n");
     printf("  --node-id=<id>        Target node ID 0-%d (default: 0)\n", can_protocol::MAX_NODE_ID);
+    printf("  --all                 Target all discovered nodes on the bus\n");
+    printf("  --nodes=<id,id,...>   Target specific nodes (comma-separated, 0-%d)\n", can_protocol::MAX_NODE_ID);
     printf("  --quiet               Suppress status messages\n");
     printf("  --help                Show this help message\n");
     printf("  --version             Show version information\n");
@@ -459,7 +468,8 @@ void print_usage(const char* prog_name) {
     printf("    identify            Blink onboard LED for 5 seconds\n");
     printf("\n");
     printf("  Monitoring:\n");
-    printf("    monitor             Display live sensor data\n");
+    printf("    monitor             Display live sensor data (dashboard view)\n");
+    printf("      --verbose, -v     Scrolling output (one line per message)\n");
     printf("      --format=<fmt>    Output format: human, json, csv (default: human)\n");
     printf("      --count=<n>       Stop after n messages (default: unlimited)\n");
     printf("      --timeout=<sec>   Stop after n seconds (default: unlimited)\n");
@@ -480,6 +490,12 @@ void print_usage(const char* prog_name) {
     printf("    sanity-test <file>  Run comprehensive device tests\n");
     printf("                        (always targets node 0, continues on failure)\n");
     printf("\n");
+    printf("MULTI-NODE:\n");
+    printf("  --all and --nodes are mutually exclusive.\n");
+    printf("  Not supported with: set-node-id, factory-reset, sanity-test\n");
+    printf("  For monitor: shows interleaved data from all targeted nodes\n");
+    printf("  For update: updates nodes sequentially, continues on failure\n");
+    printf("\n");
     printf("EXAMPLES:\n");
     printf("  %s monitor                        # Monitor node 0\n", prog_name);
     printf("  %s --node-id=1 reboot             # Reboot node 1\n", prog_name);
@@ -487,6 +503,11 @@ void print_usage(const char* prog_name) {
     printf("  %s monitor --format=json --quiet  # JSON output for scripting\n", prog_name);
     printf("  %s update firmware.bin            # Update node 0 firmware\n", prog_name);
     printf("  %s --node-id=2 update fw.bin      # Update node 2 firmware\n", prog_name);
+    printf("  %s --all monitor                  # Monitor all discovered nodes\n", prog_name);
+    printf("  %s --all info                     # Show info for all nodes\n", prog_name);
+    printf("  %s --all identify                 # Blink LED on all nodes\n", prog_name);
+    printf("  %s --nodes=0,2 reboot             # Reboot nodes 0 and 2\n", prog_name);
+    printf("  %s --all update firmware.bin      # OTA update all nodes\n", prog_name);
     printf("\n");
 }
 
@@ -535,6 +556,12 @@ bool parse_args(int argc, char* argv[], Config& config) {
             continue;
         }
 
+        // Verbose (scrolling monitor output)
+        if (strcmp(arg, "--verbose") == 0 || strcmp(arg, "-v") == 0) {
+            config.verbose = true;
+            continue;
+        }
+
         // --interface=
         if (auto val = parse_option(arg, "--interface")) {
             if (val->empty()) {
@@ -573,6 +600,40 @@ bool parse_args(int argc, char* argv[], Config& config) {
                 return false;
             }
             config.node_id = *node;
+            continue;
+        }
+
+        // --all
+        if (strcmp(arg, "--all") == 0) {
+            config.target_all = true;
+            continue;
+        }
+
+        // --nodes=0,1,2
+        if (auto val = parse_option(arg, "--nodes")) {
+            if (val->empty()) {
+                fprintf(stderr, "Error: --nodes requires a comma-separated list of node IDs\n");
+                return false;
+            }
+            std::string token;
+            std::istringstream stream(*val);
+            while (std::getline(stream, token, ',')) {
+                auto id = parse_int(token.c_str());
+                if (!id || *id < 0 || *id > can_protocol::MAX_NODE_ID) {
+                    fprintf(stderr, "Error: Invalid node ID in --nodes: %s (must be 0-%d)\n",
+                            token.c_str(), can_protocol::MAX_NODE_ID);
+                    return false;
+                }
+                config.target_nodes.push_back(*id);
+            }
+            if (config.target_nodes.empty()) {
+                fprintf(stderr, "Error: --nodes list is empty\n");
+                return false;
+            }
+            std::sort(config.target_nodes.begin(), config.target_nodes.end());
+            config.target_nodes.erase(
+                std::unique(config.target_nodes.begin(), config.target_nodes.end()),
+                config.target_nodes.end());
             continue;
         }
 
@@ -708,6 +769,28 @@ bool parse_args(int argc, char* argv[], Config& config) {
     } else {
         fprintf(stderr, "Error: Unknown command: %s\n", cmd.c_str());
         return false;
+    }
+
+    // Validate multi-node flags
+    if (config.target_all && !config.target_nodes.empty()) {
+        fprintf(stderr, "Error: --all and --nodes are mutually exclusive\n");
+        return false;
+    }
+
+    bool has_multi = config.target_all || !config.target_nodes.empty();
+    if (has_multi) {
+        if (config.command == Command::SET_NODE_ID) {
+            fprintf(stderr, "Error: set-node-id does not support --all or --nodes (single node only)\n");
+            return false;
+        }
+        if (config.command == Command::FACTORY_RESET) {
+            fprintf(stderr, "Error: factory-reset does not support --all or --nodes (single node only)\n");
+            return false;
+        }
+        if (config.command == Command::SANITY_TEST) {
+            fprintf(stderr, "Error: sanity-test does not support --all or --nodes\n");
+            return false;
+        }
     }
 
     return true;
@@ -1029,20 +1112,100 @@ static void signal_handler(int /* sig */) {
     g_running = false;
 }
 
-int cmd_monitor(CanSocket& can, const Config& config) {
-    // Calculate CAN IDs for this node's sensor messages
-    uint32_t als_id = can_protocol::make_can_id(config.node_id, can_protocol::MsgOffset::ALS_DATA);
-    uint32_t env_id = can_protocol::make_can_id(config.node_id, can_protocol::MsgOffset::ENV_DATA);
-    uint32_t aiq_id = can_protocol::make_can_id(config.node_id, can_protocol::MsgOffset::AIR_QUALITY);
+// Per-node state for dashboard display
+struct NodeState {
+    bool als_valid = false;
+    bool env_valid = false;
+    bool aiq_valid = false;
+    AlsData als = {};
+    EnvData env = {};
+    AiqData aiq = {};
+};
 
-    info("Monitoring node %d (CAN IDs: ALS=0x%03X, ENV=0x%03X, AIQ=0x%03X)\n",
-         config.node_id, als_id, env_id, aiq_id);
+// Redraw the dashboard display using ANSI escape codes
+static void dashboard_redraw(const std::vector<int>& nodes,
+                             const std::map<int, NodeState>& state,
+                             int msg_count, int elapsed_sec) {
+    // Cursor home
+    printf("\033[H");
 
-    if (config.count > 0) {
-        info("Will stop after %d messages\n", config.count);
+    // Header
+    int minutes = elapsed_sec / 60;
+    int seconds = elapsed_sec % 60;
+    printf("\033[1m=== CAN Sensor Monitor (%d node%s) === "
+           "  msgs: %d  uptime: %02d:%02d ===\033[0m\033[K\n\n",
+           static_cast<int>(nodes.size()), nodes.size() == 1 ? "" : "s",
+           msg_count, minutes, seconds);
+
+    for (int node : nodes) {
+        auto it = state.find(node);
+        if (it == state.end()) continue;
+        const NodeState& ns = it->second;
+
+        // Node header
+        const char* sensor_name = ns.als_valid ? get_sensor_type(ns.als.config_idx) : "---";
+        printf("\033[1;36mNode %d\033[0m [%s]\033[K\n", node, sensor_name);
+
+        // ALS
+        if (ns.als_valid) {
+            printf("  ALS: %6u lux   seq=%-3u  config=%-3u  %s\033[K\n",
+                   ns.als.lux, ns.als.sequence, ns.als.config_idx,
+                   ns.als.status == 0 ? "\033[32mOK\033[0m" : "\033[31mError\033[0m");
+        } else {
+            printf("  ALS: ---\033[K\n");
+        }
+
+        // ENV
+        if (ns.env_valid) {
+            printf("  ENV: %6.1f\xc2\xb0""C   %3u%% RH   %7.1f hPa  %s\033[K\n",
+                   ns.env.temperature, ns.env.humidity, ns.env.pressure,
+                   ns.env.status == 0 ? "\033[32mOK\033[0m" : "\033[31mError\033[0m");
+        } else {
+            printf("  ENV: ---\033[K\n");
+        }
+
+        // AIQ
+        if (ns.aiq_valid) {
+            const char* quality = get_iaq_quality(ns.aiq.iaq);
+            printf("  AIQ: IAQ=%-3u (%s)  acc=%u  CO2=%-4u ppm  VOC=%-4u ppm  %s\033[K\n",
+                   ns.aiq.iaq, quality, ns.aiq.accuracy,
+                   ns.aiq.co2_equiv, ns.aiq.breath_voc,
+                   ns.aiq.status == 0 ? "\033[32mOK\033[0m" : "\033[31mError\033[0m");
+        } else {
+            printf("  AIQ: ---\033[K\n");
+        }
+
+        printf("\033[K\n");
     }
-    if (config.timeout > 0) {
-        info("Will stop after %d seconds\n", config.timeout);
+
+    printf("\033[2mPress Ctrl+C to stop\033[0m\033[K\n");
+    // Clear any leftover lines below
+    printf("\033[J");
+    fflush(stdout);
+}
+
+int cmd_monitor(CanSocket& can, const Config& config, const std::vector<int>& target_nodes) {
+    // Build set for fast node membership check
+    std::set<int> target_set(target_nodes.begin(), target_nodes.end());
+
+    // Dashboard mode: HUMAN format + not verbose + not quiet
+    bool dashboard = (config.format == OutputFormat::HUMAN && !config.verbose && !config.quiet);
+
+    if (!dashboard) {
+        // Verbose/JSON/CSV: print banner
+        if (target_nodes.size() > 1) {
+            info("Monitoring nodes:");
+            for (int node : target_nodes) info(" %d", node);
+            info("\n");
+        } else {
+            uint32_t als_id = can_protocol::make_can_id(target_nodes[0], can_protocol::MsgOffset::ALS_DATA);
+            uint32_t env_id = can_protocol::make_can_id(target_nodes[0], can_protocol::MsgOffset::ENV_DATA);
+            uint32_t aiq_id = can_protocol::make_can_id(target_nodes[0], can_protocol::MsgOffset::AIR_QUALITY);
+            info("Monitoring node %d (CAN IDs: ALS=0x%03X, ENV=0x%03X, AIQ=0x%03X)\n",
+                 target_nodes[0], als_id, env_id, aiq_id);
+        }
+        if (config.count > 0) info("Will stop after %d messages\n", config.count);
+        if (config.timeout > 0) info("Will stop after %d seconds\n", config.timeout);
     }
 
     // Print CSV header if needed
@@ -1053,6 +1216,18 @@ int cmd_monitor(CanSocket& can, const Config& config) {
     // Setup signal handler for clean Ctrl+C
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+
+    // Dashboard state
+    std::map<int, NodeState> node_state;
+    for (int node : target_nodes) {
+        node_state[node] = NodeState{};
+    }
+
+    // Clear screen for dashboard
+    if (dashboard) {
+        printf("\033[2J");
+        dashboard_redraw(target_nodes, node_state, 0, 0);
+    }
 
     // Timing
     auto start_time = std::chrono::steady_clock::now();
@@ -1065,7 +1240,10 @@ int cmd_monitor(CanSocket& can, const Config& config) {
             auto now = std::chrono::steady_clock::now();
             auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
             if (elapsed >= config.timeout) {
-                info("\nTimeout reached (%d seconds)\n", config.timeout);
+                if (dashboard) {
+                    printf("\033[2J\033[H");
+                }
+                info("Timeout reached (%d seconds)\n", config.timeout);
                 break;
             }
         }
@@ -1073,26 +1251,40 @@ int cmd_monitor(CanSocket& can, const Config& config) {
         // Receive with 100ms timeout (allows checking for Ctrl+C and timeout)
         struct can_frame frame;
         if (!can.receive(frame, 100)) {
-            continue;  // Timeout or error, check loop conditions
+            // Even on timeout, redraw dashboard to update uptime
+            if (dashboard) {
+                auto now = std::chrono::steady_clock::now();
+                int elapsed = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
+                    now - start_time).count());
+                dashboard_redraw(target_nodes, node_state, msg_count, elapsed);
+            }
+            continue;
         }
 
-        // Check if message is from our target node
+        // Check if message is from a target node
         int msg_node = can_protocol::extract_node_id(frame.can_id);
-        if (msg_node != config.node_id) {
-            continue;  // Message from different node, ignore
+        if (msg_node < 0 || target_set.find(msg_node) == target_set.end()) {
+            continue;
         }
 
-        // Parse and output based on message type
+        // Parse and update state
         can_protocol::MsgOffset offset = can_protocol::extract_offset(frame.can_id);
+        bool updated = false;
 
         switch (offset) {
             case can_protocol::MsgOffset::ALS_DATA: {
                 AlsData data;
                 if (parse_als_message(frame, data)) {
-                    switch (config.format) {
-                        case OutputFormat::HUMAN: output_als_human(data, config.node_id); break;
-                        case OutputFormat::JSON:  output_als_json(data, config.node_id); break;
-                        case OutputFormat::CSV:   output_als_csv(data, config.node_id); break;
+                    if (dashboard) {
+                        node_state[msg_node].als = data;
+                        node_state[msg_node].als_valid = true;
+                        updated = true;
+                    } else {
+                        switch (config.format) {
+                            case OutputFormat::HUMAN: output_als_human(data, msg_node); break;
+                            case OutputFormat::JSON:  output_als_json(data, msg_node); break;
+                            case OutputFormat::CSV:   output_als_csv(data, msg_node); break;
+                        }
                     }
                     msg_count++;
                 }
@@ -1101,10 +1293,16 @@ int cmd_monitor(CanSocket& can, const Config& config) {
             case can_protocol::MsgOffset::ENV_DATA: {
                 EnvData data;
                 if (parse_env_message(frame, data)) {
-                    switch (config.format) {
-                        case OutputFormat::HUMAN: output_env_human(data, config.node_id); break;
-                        case OutputFormat::JSON:  output_env_json(data, config.node_id); break;
-                        case OutputFormat::CSV:   output_env_csv(data, config.node_id); break;
+                    if (dashboard) {
+                        node_state[msg_node].env = data;
+                        node_state[msg_node].env_valid = true;
+                        updated = true;
+                    } else {
+                        switch (config.format) {
+                            case OutputFormat::HUMAN: output_env_human(data, msg_node); break;
+                            case OutputFormat::JSON:  output_env_json(data, msg_node); break;
+                            case OutputFormat::CSV:   output_env_csv(data, msg_node); break;
+                        }
                     }
                     msg_count++;
                 }
@@ -1113,32 +1311,56 @@ int cmd_monitor(CanSocket& can, const Config& config) {
             case can_protocol::MsgOffset::AIR_QUALITY: {
                 AiqData data;
                 if (parse_aiq_message(frame, data)) {
-                    switch (config.format) {
-                        case OutputFormat::HUMAN: output_aiq_human(data, config.node_id); break;
-                        case OutputFormat::JSON:  output_aiq_json(data, config.node_id); break;
-                        case OutputFormat::CSV:   output_aiq_csv(data, config.node_id); break;
+                    if (dashboard) {
+                        node_state[msg_node].aiq = data;
+                        node_state[msg_node].aiq_valid = true;
+                        updated = true;
+                    } else {
+                        switch (config.format) {
+                            case OutputFormat::HUMAN: output_aiq_human(data, msg_node); break;
+                            case OutputFormat::JSON:  output_aiq_json(data, msg_node); break;
+                            case OutputFormat::CSV:   output_aiq_csv(data, msg_node); break;
+                        }
                     }
                     msg_count++;
                 }
                 break;
             }
             default:
-                // Ignore other message types
                 break;
         }
 
-        // Flush output for real-time display
-        fflush(stdout);
+        // Redraw dashboard on update
+        if (dashboard && updated) {
+            auto now = std::chrono::steady_clock::now();
+            int elapsed = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
+                now - start_time).count());
+            dashboard_redraw(target_nodes, node_state, msg_count, elapsed);
+        }
+
+        // Flush for verbose/json/csv
+        if (!dashboard) {
+            fflush(stdout);
+        }
 
         // Check message count limit
         if (config.count > 0 && msg_count >= config.count) {
-            info("\nMessage count reached (%d messages)\n", config.count);
+            if (dashboard) {
+                printf("\033[2J\033[H");
+            }
+            info("Message count reached (%d messages)\n", config.count);
             break;
         }
     }
 
+    // Clean exit
+    if (dashboard) {
+        // Move cursor below the dashboard before printing exit message
+        printf("\033[2J\033[H");
+    }
+
     if (!g_running) {
-        info("\nInterrupted\n");
+        info("Interrupted\n");
     }
 
     info("Total messages received: %d\n", msg_count);
@@ -1349,12 +1571,11 @@ int cmd_info(CanSocket& can, const Config& config) {
  * Discover Command
  * ========================================================================== */
 
-int cmd_discover(CanSocket& can, const Config& config) {
-    info("Discovering sensor nodes on %s...\n", can.interface().c_str());
-
-    // Track which nodes responded
+// Discover all nodes on the CAN bus by sending PINGs and collecting PONGs.
+// Returns sorted vector of responding node IDs.
+std::vector<int> discover_nodes(CanSocket& can, int timeout_ms = 500) {
+    std::vector<int> found;
     bool node_found[can_protocol::MAX_NODE_ID + 1] = {false};
-    int nodes_found = 0;
 
     // Send PING to all possible node addresses
     for (int node = 0; node <= can_protocol::MAX_NODE_ID; node++) {
@@ -1362,56 +1583,67 @@ int cmd_discover(CanSocket& can, const Config& config) {
         can.send(ping_id);
     }
 
-    // Wait for PONG responses (500ms total, enough for 16 nodes)
+    // Wait for PONG responses
     auto start = std::chrono::steady_clock::now();
-    const int timeout_ms = 500;
-
     while (true) {
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start).count();
-
-        if (elapsed >= timeout_ms) {
-            break;
-        }
+        if (elapsed >= timeout_ms) break;
 
         struct can_frame frame;
         int remaining = timeout_ms - static_cast<int>(elapsed);
         if (can.receive(frame, remaining)) {
-            // Check if this is a PONG response
             int node = can_protocol::extract_node_id(frame.can_id);
             if (node >= 0 && node <= can_protocol::MAX_NODE_ID) {
                 can_protocol::MsgOffset offset = can_protocol::extract_offset(frame.can_id);
                 if (offset == can_protocol::MsgOffset::PONG && !node_found[node]) {
                     node_found[node] = true;
-                    nodes_found++;
-
-                    uint8_t reported_node = frame.data[0];
-
-                    switch (config.format) {
-                        case OutputFormat::HUMAN:
-                            printf("  Node %d found (base 0x%03X)\n", reported_node,
-                                   can_protocol::BASE_ADDR_NODE_0 + reported_node * can_protocol::NODE_ADDR_SPACING);
-                            break;
-                        case OutputFormat::JSON:
-                            printf("{\"type\":\"discover\",\"node\":%d,\"base_addr\":\"0x%03X\"}\n",
-                                   reported_node,
-                                   can_protocol::BASE_ADDR_NODE_0 + reported_node * can_protocol::NODE_ADDR_SPACING);
-                            break;
-                        case OutputFormat::CSV:
-                            printf("discover,%d,0x%03X\n", reported_node,
-                                   can_protocol::BASE_ADDR_NODE_0 + reported_node * can_protocol::NODE_ADDR_SPACING);
-                            break;
-                    }
+                    found.push_back(node);
                 }
             }
         }
     }
 
+    std::sort(found.begin(), found.end());
+    return found;
+}
+
+// Resolve target node list from config flags.
+std::vector<int> resolve_target_nodes(CanSocket& can, const Config& config) {
+    if (config.target_all) {
+        return discover_nodes(can);
+    }
+    if (!config.target_nodes.empty()) {
+        return config.target_nodes;
+    }
+    return { config.node_id };
+}
+
+int cmd_discover(CanSocket& can, const Config& config) {
+    info("Discovering sensor nodes on %s...\n", can.interface().c_str());
+
+    std::vector<int> nodes = discover_nodes(can);
+
+    for (int node : nodes) {
+        uint32_t base = can_protocol::BASE_ADDR_NODE_0 + node * can_protocol::NODE_ADDR_SPACING;
+        switch (config.format) {
+            case OutputFormat::HUMAN:
+                printf("  Node %d found (base 0x%03X)\n", node, base);
+                break;
+            case OutputFormat::JSON:
+                printf("{\"type\":\"discover\",\"node\":%d,\"base_addr\":\"0x%03X\"}\n", node, base);
+                break;
+            case OutputFormat::CSV:
+                printf("discover,%d,0x%03X\n", node, base);
+                break;
+        }
+    }
+
     if (config.format == OutputFormat::HUMAN) {
-        if (nodes_found == 0) {
+        if (nodes.empty()) {
             printf("No sensor nodes found.\n");
         } else {
-            printf("\nFound %d node(s).\n", nodes_found);
+            printf("\nFound %d node(s).\n", static_cast<int>(nodes.size()));
         }
     }
 
@@ -2243,6 +2475,89 @@ int cmd_sanity_test(CanSocket& can, const Config& config) {
 }
 
 /* ============================================================================
+ * Multi-Node Dispatch Functions
+ * ========================================================================== */
+
+// Execute a fire-and-forget command for each target node.
+int dispatch_multi_cmd(CanSocket& can, const Config& config,
+                       const std::vector<int>& nodes,
+                       int (*cmd_fn)(CanSocket&, const Config&),
+                       const char* cmd_name) {
+    int failures = 0;
+    for (size_t i = 0; i < nodes.size(); i++) {
+        Config node_config = config;
+        node_config.node_id = nodes[i];
+        int rc = cmd_fn(can, node_config);
+        if (rc != 0) {
+            fprintf(stderr, "Warning: %s failed for node %d\n", cmd_name, nodes[i]);
+            failures++;
+        }
+        // Small delay between nodes to avoid CAN bus contention
+        if (i + 1 < nodes.size()) {
+            usleep(50000);  // 50ms
+        }
+    }
+    return (failures > 0) ? 1 : 0;
+}
+
+// Execute info command for each target node.
+int dispatch_info(CanSocket& can, const Config& config,
+                  const std::vector<int>& nodes) {
+    int failures = 0;
+    for (size_t i = 0; i < nodes.size(); i++) {
+        Config node_config = config;
+        node_config.node_id = nodes[i];
+        int rc = cmd_info(can, node_config);
+        if (rc != 0) {
+            fprintf(stderr, "Warning: info failed for node %d (no response)\n", nodes[i]);
+            failures++;
+        }
+        if (config.format == OutputFormat::HUMAN && i + 1 < nodes.size()) {
+            printf("\n");
+        }
+    }
+    return (failures > 0) ? 1 : 0;
+}
+
+// Execute OTA update sequentially for each target node.
+// Continues on failure, prints summary at end.
+int dispatch_update(CanSocket& can, const Config& config,
+                    const std::vector<int>& nodes) {
+    struct UpdateResult {
+        int node_id;
+        bool success;
+    };
+    std::vector<UpdateResult> results;
+
+    for (int node : nodes) {
+        info("\n--- OTA Update: Node %d ---\n", node);
+        Config node_config = config;
+        node_config.node_id = node;
+        int rc = cmd_update(can, node_config);
+        results.push_back({node, rc == 0});
+        if (rc != 0) {
+            fprintf(stderr, "Warning: OTA update failed for node %d, continuing...\n", node);
+        }
+    }
+
+    // Print summary
+    info("\n--- OTA Update Summary ---\n");
+    int passed = 0, failed = 0;
+    for (const auto& r : results) {
+        if (r.success) {
+            info("  Node %d: OK\n", r.node_id);
+            passed++;
+        } else {
+            fprintf(stderr, "  Node %d: FAILED\n", r.node_id);
+            failed++;
+        }
+    }
+    info("  Total: %d/%d succeeded\n", passed, static_cast<int>(results.size()));
+
+    return (failed > 0) ? 1 : 0;
+}
+
+/* ============================================================================
  * Main
  * ========================================================================== */
 
@@ -2277,49 +2592,80 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    info("Connected to %s (node %d, base address 0x%03X)\n",
-         config.interface.c_str(), config.node_id,
-         can_protocol::BASE_ADDR_NODE_0 + config.node_id * can_protocol::NODE_ADDR_SPACING);
+    // Resolve target nodes
+    bool is_multi = config.target_all || !config.target_nodes.empty();
+    std::vector<int> target_nodes;
+
+    // Skip discovery for commands that don't use target_nodes
+    if (config.command == Command::DISCOVER) {
+        // discover scans all nodes internally
+        target_nodes = {};
+    } else if (is_multi) {
+        if (config.target_all) {
+            info("Discovering nodes on %s...\n", config.interface.c_str());
+        }
+        target_nodes = resolve_target_nodes(can, config);
+        if (target_nodes.empty()) {
+            fprintf(stderr, "Error: No nodes found\n");
+            return 1;
+        }
+        if (config.target_all) {
+            info("Found %d node(s):", static_cast<int>(target_nodes.size()));
+            for (int n : target_nodes) info(" %d", n);
+            info("\n");
+        }
+    } else {
+        target_nodes = { config.node_id };
+        info("Connected to %s (node %d, base address 0x%03X)\n",
+             config.interface.c_str(), config.node_id,
+             can_protocol::BASE_ADDR_NODE_0 + config.node_id * can_protocol::NODE_ADDR_SPACING);
+    }
 
     // Execute command
     int result = 0;
     switch (config.command) {
+        // Multi-node capable: fire-and-forget
         case Command::START:
-            result = cmd_start(can, config);
+            result = dispatch_multi_cmd(can, config, target_nodes, cmd_start, "start");
             break;
         case Command::STOP:
-            result = cmd_stop(can, config);
+            result = dispatch_multi_cmd(can, config, target_nodes, cmd_stop, "stop");
             break;
         case Command::SHUTDOWN:
-            result = cmd_shutdown(can, config);
+            result = dispatch_multi_cmd(can, config, target_nodes, cmd_shutdown, "shutdown");
             break;
         case Command::REBOOT:
-            result = cmd_reboot(can, config);
+            result = dispatch_multi_cmd(can, config, target_nodes, cmd_reboot, "reboot");
             break;
-        case Command::FACTORY_RESET:
-            result = cmd_factory_reset(can, config);
+        case Command::IDENTIFY:
+            result = dispatch_multi_cmd(can, config, target_nodes, cmd_identify, "identify");
+            break;
+
+        // Multi-node capable: with response handling
+        case Command::INFO:
+            result = dispatch_info(can, config, target_nodes);
             break;
         case Command::MONITOR:
-            result = cmd_monitor(can, config);
+            result = cmd_monitor(can, config, target_nodes);
+            break;
+        case Command::UPDATE:
+            result = dispatch_update(can, config, target_nodes);
+            break;
+
+        // Single-node only (validated in parse_args)
+        case Command::FACTORY_RESET:
+            result = cmd_factory_reset(can, config);
             break;
         case Command::SET_NODE_ID:
             result = cmd_set_node_id(can, config);
             break;
-        case Command::INFO:
-            result = cmd_info(can, config);
-            break;
         case Command::DISCOVER:
             result = cmd_discover(can, config);
-            break;
-        case Command::UPDATE:
-            result = cmd_update(can, config);
             break;
         case Command::SANITY_TEST:
             result = cmd_sanity_test(can, config);
             break;
-        case Command::IDENTIFY:
-            result = cmd_identify(can, config);
-            break;
+
         default:
             fprintf(stderr, "Error: No command specified\n");
             result = 1;

@@ -192,11 +192,33 @@ can-sensor-tool --node=1 info
 
 #### Monitoring
 ```bash
-# Monitor all sensor messages
+# Monitor sensor data (live dashboard, updates in-place)
 can-sensor-tool monitor
 
 # Monitor specific node
 can-sensor-tool --node=1 monitor
+
+# Monitor all discovered nodes (dashboard)
+can-sensor-tool --all monitor
+
+# Scrolling output (one line per message, for debugging)
+can-sensor-tool monitor --verbose
+can-sensor-tool --all monitor --verbose
+```
+
+#### Multi-Node Commands
+```bash
+# Target all discovered nodes
+can-sensor-tool --all info
+can-sensor-tool --all identify
+can-sensor-tool --all reboot
+
+# Target specific nodes
+can-sensor-tool --nodes=0,2 identify
+can-sensor-tool --nodes=0,1,2 reboot
+
+# OTA update all nodes (sequential, continues on failure)
+can-sensor-tool --all update firmware.bin
 ```
 
 #### Node Management

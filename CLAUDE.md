@@ -70,7 +70,8 @@ sudo make install       # Install to /usr/local/bin
 can-sensor-tool ping                           # Discover all nodes on CAN bus
 can-sensor-tool info                           # Get device info for node 0
 can-sensor-tool --node=1 info                  # Get device info for node 1
-can-sensor-tool monitor                        # Monitor all sensor messages
+can-sensor-tool monitor                        # Monitor sensor data (dashboard)
+can-sensor-tool monitor --verbose              # Monitor with scrolling output
 can-sensor-tool start                          # Start sensor transmission
 can-sensor-tool stop                           # Stop sensor transmission
 can-sensor-tool reboot                         # Reboot node (saves calibration)
@@ -79,6 +80,13 @@ can-sensor-tool set-id 2                       # Change node ID
 can-sensor-tool identify                       # Blink onboard LED for 5 seconds
 can-sensor-tool --node=2 identify              # Identify specific node
 can-sensor-tool update ./build/esp32-can-sensor.bin  # OTA firmware update
+
+# Multi-node commands (--all or --nodes=)
+can-sensor-tool --all monitor                  # Dashboard with all nodes
+can-sensor-tool --all info                     # Show info for all nodes
+can-sensor-tool --all identify                 # Blink LED on all nodes
+can-sensor-tool --nodes=0,2 reboot             # Reboot specific nodes
+can-sensor-tool --all update firmware.bin      # OTA update all nodes sequentially
 ```
 
 ### Calibration Utility (C++)
