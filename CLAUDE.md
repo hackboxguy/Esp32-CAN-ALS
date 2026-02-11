@@ -4,15 +4,43 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Summary
 
-ESP32-C3/C6 automotive CAN node with **multi-sensor support**: ambient light sensors (VEML7700/OPT4001) and environmental sensors (BME680/BME688). Production-ready implementation with runtime auto-detection, intelligent auto-ranging, and modular queue-based architecture designed for expansion.
+ESP32-C3/C6 automotive CAN node with **multi-sensor support**: ambient light sensors (VEML7700/OPT3001/OPT4001) and environmental sensors (BME680/BME688). Production-ready implementation with runtime auto-detection, intelligent auto-ranging, A/B OTA firmware updates over CAN, and modular queue-based architecture designed for expansion.
 
 **Sensor Support:**
-- **Ambient Light:** VEML7700 (0-120K lux, calibrated) OR OPT4001 (0-2.2M lux, factory calibrated)
+- **Ambient Light:** VEML7700 (0-120K lux, calibrated) OR OPT3001 (0-83K lux) OR OPT4001 (0-2.2M lux, factory calibrated)
 - **Environmental:** BME680/BME688 with BSEC 2.x (temperature, humidity, pressure, air quality)
+
+**Key Capabilities:**
+- A/B OTA firmware updates over CAN bus (~3 KB/s) with automatic rollback
+- Multi-node support (up to 16 nodes, configurable IDs 0-15)
+- `can-sensor-tool` CLI for node discovery, monitoring, OTA updates, and management
 
 ## Build and Development Commands
 
-### ESP32 Firmware
+### ESP32 Firmware (using build.sh - preferred)
+
+```bash
+# First build (specify target)
+./build.sh --target=esp32c6                    # or esp32c3
+./build.sh --target=esp32c6 --version=1.2.3    # with firmware version
+
+# Rebuild (target remembered from previous build)
+./build.sh
+
+# Build and flash
+./build.sh --flash --port=/dev/ttyUSB0
+
+# Flash existing binary without rebuilding
+./build.sh --flash-only --port=/dev/ttyUSB0
+
+# Clean build
+./build.sh --clean --target=esp32c6
+
+# Build with BSEC library for BME680/688 support
+./build.sh --target=esp32c6 --bsecpath=/path/to/bsec2-6-1-0_generic_release_22102024.zip
+```
+
+### ESP32 Firmware (using idf.py directly)
 
 ```bash
 # Set target for your ESP32 variant
@@ -29,6 +57,26 @@ idf.py fullclean && idf.py build
 
 # Check binary size
 idf.py size-components
+```
+
+### CAN Sensor Tool (C++ node management CLI)
+
+```bash
+cd tools/
+make                    # Build
+sudo make install       # Install to /usr/local/bin
+
+# Usage
+can-sensor-tool ping                           # Discover all nodes on CAN bus
+can-sensor-tool info                           # Get device info for node 0
+can-sensor-tool --node=1 info                  # Get device info for node 1
+can-sensor-tool monitor                        # Monitor all sensor messages
+can-sensor-tool start                          # Start sensor transmission
+can-sensor-tool stop                           # Stop sensor transmission
+can-sensor-tool reboot                         # Reboot node (saves calibration)
+can-sensor-tool factory-reset                  # Factory reset (clears calibration)
+can-sensor-tool set-id 2                       # Change node ID
+can-sensor-tool update ./build/esp32-can-sensor.bin  # OTA firmware update
 ```
 
 ### Calibration Utility (C++)
@@ -99,38 +147,49 @@ cansend can0 114#        # Factory reset
 
 ```
 main/
-├── main.c (~420 lines) - Task coordination and initialization
+├── main.c (~695 lines) - Task coordination and initialization
 │   ├── sensor_poll_task: Periodic sensor reading (1 Hz)
-│   ├── twai_receive_task: CAN command reception (START/STOP)
-│   ├── twai_transmit_task: CAN message transmission
+│   ├── bme680_sensor_task: BSEC-driven environmental reading (3s)
+│   ├── twai_receive_task: CAN command reception + OTA dispatch
+│   ├── twai_transmit_task: CAN message transmission from queue
 │   └── twai_control_task: Auto-start trigger (one-shot)
 │
-├── sensor_common.h (60 lines) - Shared data structures
-│   ├── sensor_id_t: Sensor enumeration
+├── sensor_common.h (~65 lines) - Shared data structures
+│   ├── sensor_id_t: Sensor enumeration (VEML7700, BME680, LD2410, MQ3)
 │   ├── sensor_data_t: Unified sensor data union
 │   └── Status codes and constants
 │
-├── als_driver.c/h (~270 lines) - Ambient Light Sensor abstraction layer
-│   ├── Runtime auto-detection (I2C address probing)
-│   ├── Unified API for VEML7700 or OPT4001
+├── firmware_config.h (~26 lines) - Feature flags and version
+│   └── Version overridable via CMake -D flags
+│
+├── als_driver.c/h (~300 lines) - Ambient Light Sensor abstraction layer
+│   ├── Runtime auto-detection (I2C address probing: 0x10, 0x44)
+│   ├── Unified API for VEML7700, OPT3001, or OPT4001
 │   ├── I2C bus initialization
 │   └── Sensor type identification via config index
 │
-├── veml7700_driver.c/h (~550 lines) - VEML7700 sensor module
+├── veml7700_driver.c/h (~540 lines) - VEML7700 sensor module
 │   ├── I2C communication functions
 │   ├── Configuration table (21 configs: gain × integration time)
 │   ├── Intelligent auto-ranging algorithm with saturation ramp-up
 │   ├── Moving average filter (8 samples)
 │   └── Calibration correction (piecewise linear, 0-120K lux range)
 │
-├── opt4001_driver.c/h (~230 lines) - OPT4001 sensor module
+├── opt4001_driver.c/h (~270 lines) - OPT4001 sensor module
 │   ├── I2C communication (big-endian)
 │   ├── Hardware auto-ranging (12 ranges, 0-11)
 │   ├── 800ms integration time (highest accuracy)
 │   ├── Factory-calibrated (SOT-5x3 package)
-│   └── No filtering needed (stable readings)
+│   └── Config index: 100-111
 │
-├── bme680_bsec.c/h (~1050 lines) - BME680/BME688 environmental sensor with BSEC
+├── opt3001_driver.c/h (~280 lines) - OPT3001 sensor module
+│   ├── I2C communication (I2C address 0x44, shared with OPT4001)
+│   ├── Hardware auto-ranging (12 ranges, 0-11)
+│   ├── 800ms conversion time, continuous mode
+│   ├── Factory-calibrated (0-83,865 lux range)
+│   └── Config index: 200-211
+│
+├── bme680_bsec.c/h (~1075 lines) - BME680/BME688 environmental sensor with BSEC
 │   ├── Runtime auto-detection (I2C address 0x76/0x77)
 │   ├── BSEC 2.6.1.0 library integration (IAQ/CO2/VOC enabled)
 │   ├── Virtual sensor subscription with 8 BSEC outputs
@@ -139,10 +198,30 @@ main/
 │   ├── NVS state management (auto-saves every 4 hours)
 │   └── Calibration persistence across reboots
 │
-└── can_protocol.c/h (~300 lines) - CAN message formatting
-    ├── Message ID definitions
-    ├── can_format_veml7700_message()
-    └── Checksum calculation
+├── ota_handler.c/h (~575 lines) - A/B OTA firmware updates over CAN
+│   ├── State machine: IDLE → RECEIVING → VERIFYING → COMPLETE
+│   ├── 6-byte chunks per CAN frame with sequence numbers
+│   ├── CRC32 verification of complete firmware image
+│   ├── Automatic rollback on failed boot (3 attempts)
+│   └── Session timeout (5 min) and retry logic (3 retries)
+│
+├── can_protocol.c/h (~535 lines) - CAN message formatting & protocol definitions
+│   ├── Node addressing: base 0x100, spacing 0x20 (32 IDs/node)
+│   ├── Message ID definitions for all sensors and control commands
+│   ├── OTA protocol message IDs (0x700 base)
+│   ├── Format functions for lux, environmental, air quality messages
+│   └── Checksum calculation
+│
+tools/
+├── can-sensor-tool.cpp (~81K) - Complete C++ CLI for node management
+│   ├── Device discovery (ping all nodes)
+│   ├── Sensor monitoring with decoded output
+│   ├── Node control (start/stop/reboot/factory-reset)
+│   ├── Node ID configuration
+│   └── OTA firmware updates with progress display
+│
+calibration/
+└── calibrate_lux_sensor.cpp (~29K) - Interactive lux calibration utility
 ```
 
 ### Data Flow Architecture
@@ -209,7 +288,7 @@ main/
 
 ### Ambient Light Sensor Support
 
-The firmware supports two ambient light sensors with **runtime auto-detection**:
+The firmware supports three ambient light sensors with **runtime auto-detection**:
 
 **VEML7700** (I2C address 0x10):
 - **Range:** 0-120,000 lux
@@ -228,18 +307,30 @@ The firmware supports two ambient light sensors with **runtime auto-detection**:
 - **Best for:** Wide dynamic range applications, direct sunlight measurement
 - **Config index:** 100-111 (range 0-11 + 100 offset)
 
+**OPT3001** (I2C address 0x44):
+- **Range:** 0-83,865 lux
+- **Auto-ranging:** 12 hardware ranges (managed by sensor)
+- **Calibration:** Factory calibrated
+- **Formula:** `lux = 0.01 × 2^exponent × mantissa`
+- **Integration time:** 800ms (continuous conversion mode)
+- **Best for:** Mid-range applications, cost-effective alternative
+- **Config index:** 200-211 (range 0-11 + 200 offset)
+- **Note:** Shares I2C address 0x44 with OPT4001; only one can be connected
+
 **Auto-Detection Logic** [als_driver.c]:
 1. Initialize I2C bus
 2. Probe address 0x10 (VEML7700)
    - If found → initialize VEML7700 driver
-3. Probe address 0x44 (OPT4001)
-   - If found → initialize OPT4001 driver
+3. Probe address 0x44 (OPT4001 / OPT3001)
+   - Device ID distinguishes OPT4001 vs OPT3001
+   - If found → initialize appropriate driver
 4. Use detected sensor transparently via unified API
 
 **Sensor Identification:**
 - CAN clients can identify sensor type via config index:
   - Config 0-20 = VEML7700
   - Config 100-111 = OPT4001
+  - Config 200-211 = OPT3001
 
 ### BME680/BME688 Environmental Sensor Support
 
@@ -318,6 +409,37 @@ The firmware supports BME680/BME688 environmental sensors with **runtime auto-de
    - Solution: Replaced BME680 board - new sensor works perfectly
    - Measurement time with working sensor: 1142ms (expected for 1000ms heater duration)
 
+### A/B OTA Firmware Updates
+
+The firmware supports over-the-air updates via CAN bus using an A/B partition scheme:
+
+**Flash Layout (4MB):**
+```
+NVS:     0x9000  (24KB)  - Calibration, node ID storage
+OTA Data: 0x10000 (8KB)  - Tracks active partition
+OTA_0:   0x20000 (~1.94MB) - Firmware slot A
+OTA_1:   0x210000 (~1.94MB) - Firmware slot B
+```
+
+**How it works:**
+1. Initial USB flash writes firmware to OTA_0
+2. First CAN OTA update writes to OTA_1, reboots to OTA_1
+3. Next CAN OTA update writes to OTA_0, reboots to OTA_0
+4. Continues alternating (ping-pong) between slots
+
+**Automatic Rollback:**
+- New firmware must call `esp_ota_mark_app_valid()` within first boot
+- If firmware crashes before validation, bootloader reverts to previous slot
+- After 3 failed boot attempts, automatically rolls back
+
+**OTA Protocol (CAN):**
+- OTA base: 0x700, spacing 0x10 per node
+- 6-byte chunks per CAN frame with sequence numbers
+- CRC32 verification of complete firmware image
+- Transfer speed: ~3 KB/s
+- Session timeout: 5 minutes, max 3 retries per chunk
+- Use `can-sensor-tool update firmware.bin` for managed updates
+
 ### CAN Protocol
 
 **Node Addressing:**
@@ -331,9 +453,16 @@ The firmware supports BME680/BME688 environmental sensors with **runtime auto-de
 - `0x112`: SHUTDOWN - Graceful shutdown (save BSEC state, stop TX, keep ESP32 running)
 - `0x113`: REBOOT - Save BSEC state and reboot ESP32
 - `0x114`: FACTORY_RESET - Clear BSEC calibration (factory default) and reboot
+- `0x115`: SET_NODE_ID - Change node ID (byte 0 = new ID, 0-15)
+- `0x116`: GET_DEVICE_INFO - Request device info
+- `0x118`: DISCOVERY_PING - Ping for device discovery
+
+**Response Messages (TX - from ESP32 to master, Node 0 example):**
+- `0x117`: DEVICE_INFO_RESPONSE - Firmware version, sensor flags, partition info
+- `0x119`: DISCOVERY_PONG - Response to discovery ping
 
 **Data Messages (TX - from ESP32 to master, Node 0 example):**
-- `0x100`: Ambient light data (1 Hz, VEML7700 or OPT4001)
+- `0x100`: Ambient light data (1 Hz, VEML7700, OPT3001, or OPT4001)
 - `0x101`: BME680 environmental data (0.33 Hz, T/H/P)
 - `0x102`: BME680 air quality data (0.33 Hz, IAQ/CO2/VOC)
 - `0x103-0x106`: BME688 gas selectivity classes 1-4 (future)
@@ -345,7 +474,7 @@ The firmware supports BME680/BME688 environmental sensors with **runtime auto-de
 Byte 0-2: Lux value (uint24_t, little-endian, 0-16,777,215)
 Byte 3:   Status (0x00=OK, 0x01=Error)
 Byte 4:   Sequence counter (rolls over)
-Byte 5:   Config index (0-20=VEML7700, 100-111=OPT4001)
+Byte 5:   Config index (0-20=VEML7700, 100-111=OPT4001, 200-211=OPT3001)
 Byte 6-7: Checksum (sum of bytes 0-5, uint16_t LE)
 ```
 
@@ -365,6 +494,18 @@ Byte 2:   IAQ Accuracy (uint8_t, 0-3: 0=uncalibrated, 3=fully calibrated)
 Byte 3-4: CO2 equivalent (uint16_t, ppm)
 Byte 5-6: Breath VOC equivalent (uint16_t, ppm)
 Byte 7:   Status (0x00=OK, 0x01=Error)
+```
+
+**Message Format offset 0x17 (Device Info Response):**
+```
+Byte 0:   Node ID
+Byte 1:   Firmware major version
+Byte 2:   Firmware minor version
+Byte 3:   Firmware patch version
+Byte 4:   Sensor flags (bit 0: ALS, bit 1: BME680, etc.)
+Byte 5:   ALS type (0=none, 1=VEML7700, 2=OPT4001, 3=OPT3001)
+Byte 6:   Status flags (bit 0: transmitting)
+Byte 7:   Partition info (bits 0-2: type, bits 4-6: OTA state)
 ```
 
 **Control Command Usage Examples:**
@@ -394,7 +535,7 @@ GPIO7:  I2C SCL (Shared bus for all I2C sensors)
 ```
 
 **I2C Bus Sharing:**
-- VEML7700 @ 0x10 OR OPT4001 @ 0x44 (Ambient light - only one should be connected)
+- VEML7700 @ 0x10 OR OPT4001/OPT3001 @ 0x44 (Ambient light - only one at a time)
 - BME680/BME688 @ 0x76 or 0x77 (Environmental sensor)
 - All sensors share the same I2C bus (I2C_NUM_0)
 - Pull-up resistors: 4.7kΩ recommended
@@ -516,9 +657,15 @@ The codebase uses a **modular, queue-based architecture** designed for expansion
 7. Update `CMakeLists.txt` to include new source files
 
 **Existing Modular Components:**
-- `veml7700_driver.c/h`: VEML7700 sensor (I2C)
+- `veml7700_driver.c/h`: VEML7700 sensor (I2C, software auto-ranging)
+- `opt4001_driver.c/h`: OPT4001 sensor (I2C, hardware auto-ranging)
+- `opt3001_driver.c/h`: OPT3001 sensor (I2C, hardware auto-ranging)
+- `bme680_bsec.c/h`: BME680/BME688 with BSEC 2.x integration
+- `als_driver.c/h`: Unified ALS abstraction with auto-detection
+- `ota_handler.c/h`: A/B OTA firmware updates over CAN
 - `sensor_common.h`: Shared data structures and enums
-- `can_protocol.c/h`: CAN message formatting utilities
+- `can_protocol.c/h`: CAN message formatting and protocol definitions
+- `firmware_config.h`: Feature flags and version constants
 - `main.c`: Task coordination and queue management
 
 See `EXPANSION_GUIDE.md` for detailed multi-sensor expansion plan (BME680, LD2410, BME688, MQ-3)
@@ -531,7 +678,7 @@ See `EXPANSION_GUIDE.md` for detailed multi-sensor expansion plan (BME680, LD241
 - VEML7700 address: 0x10 (cannot be changed)
 
 **CAN messages not seen on bus:**
-- Verify TJA1050 has 5V supply (required for proper signaling)
+- Verify CAN transceiver (SN65HVD230) has proper supply voltage
 - Check termination resistors (120Ω at both ends)
 - Bitrate must match: 500 kbps
 
@@ -596,6 +743,18 @@ See `EXPANSION_GUIDE.md` for detailed multi-sensor expansion plan (BME680, LD241
 - Verify gas heater is enabled (should see 380°C in logs)
 - Check BSEC virtual sensor subscription succeeded (no warning 10)
 
+**OTA update fails or stalls:**
+- Ensure node is responding: `can-sensor-tool ping`
+- Try with longer chunk delay: `can-sensor-tool --chunk-delay=10 update firmware.bin`
+- Check for CAN bus errors: `ip -s link show can0`
+- Verify firmware binary size fits in partition (~1.94 MB max)
+- Check for OTA session timeout (5 min idle = abort)
+
+**Node not discovered by can-sensor-tool:**
+- Verify CAN interface is up: `ip link show can0`
+- Check node ID hasn't been changed: try `can-sensor-tool --node=N ping` for N=0-15
+- Ensure firmware is running (not stuck in bootloader)
+
 **"Unknown BSEC output sensor_id=12/13" warnings:**
 - These are stabilization_status and run_in_status outputs
 - Not critical for operation, just status flags
@@ -606,7 +765,7 @@ See `EXPANSION_GUIDE.md` for detailed multi-sensor expansion plan (BME680, LD241
 
 ### Unit Testing
 - [ ] I2C communication (read/write registers)
-- [ ] Sensor auto-detection (VEML7700 @ 0x10, OPT4001 @ 0x44, BME680 @ 0x76/0x77)
+- [ ] Sensor auto-detection (VEML7700 @ 0x10, OPT4001/OPT3001 @ 0x44, BME680 @ 0x76/0x77)
 - [ ] All 21 VEML7700 configurations apply correctly
 - [ ] OPT4001 device ID verification (0x121)
 - [ ] OPT4001 config register write/readback
@@ -651,6 +810,16 @@ See `EXPANSION_GUIDE.md` for detailed multi-sensor expansion plan (BME680, LD241
 - [ ] SHUTDOWN command (offset 0x12) - state saved, TX stops, ESP32 keeps running
 - [ ] REBOOT command (offset 0x13) - state saved, ESP32 reboots, calibration restored
 - [ ] FACTORY_RESET command (offset 0x14) - calibration cleared, IAQ accuracy returns to 0
+- [ ] SET_NODE_ID command (offset 0x15) - node ID changes and persists in NVS
+- [ ] GET_DEVICE_INFO command (offset 0x16) - returns firmware version and sensor flags
+- [ ] DISCOVERY_PING command (offset 0x18) - node responds with pong
+
+### Integration Testing - OTA
+- [ ] OTA update via can-sensor-tool: `can-sensor-tool update firmware.bin`
+- [ ] Partition alternates between OTA_0 and OTA_1
+- [ ] Automatic rollback on corrupted firmware
+- [ ] OTA session timeout after 5 minutes of inactivity
+- [ ] CRC32 verification rejects corrupted images
 
 ### Integration Testing - Multi-Sensor
 - [ ] All sensors coexist on shared I2C bus
@@ -724,6 +893,13 @@ The codebase has been refactored with a **modular, queue-based architecture** re
 - ✅ NVS state persistence for calibration
 - ✅ CAN messages for T/H/P (offset 0x01) and IAQ/CO2/VOC (offset 0x02)
 - ✅ Graceful shutdown commands (offsets 0x12, 0x13, 0x14)
+
+**Additional Completed Features:**
+- ✅ OPT3001 ambient light sensor support (0-83K lux, config index 200-211)
+- ✅ A/B OTA firmware updates over CAN bus with automatic rollback
+- ✅ `can-sensor-tool` CLI for node discovery, monitoring, OTA, and management
+- ✅ Multi-node addressing with configurable node IDs (0-15)
+- ✅ Device discovery and info commands (0x115-0x119)
 
 **Next Phases (Planned):**
 - Phase 2: Add HLK-LD2410 human presence radar (UART)

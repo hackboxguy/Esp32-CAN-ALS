@@ -81,13 +81,23 @@ sudo apt-get install git wget flex bison gperf python3 python3-pip python3-venv 
 mkdir ~/esp && cd ~/esp
 git clone --recursive https://github.com/espressif/esp-idf.git
 
-# Install ESP-IDF
+# Install ESP-IDF toolchain for your target chip(s)
 cd ~/esp/esp-idf
-./install.sh esp32c6
+./install.sh esp32c3          # for ESP32-C3
+# or: ./install.sh esp32c6    # for ESP32-C6
+# or: ./install.sh esp32c3,esp32c6  # for both
 
-# Setup environment (add to ~/.bashrc)
+# Activate ESP-IDF environment (required in every new terminal)
 . ~/esp/esp-idf/export.sh
+
+# Verify it worked
+idf.py --version
 ```
+
+**Important notes:**
+- `export.sh` requires **bash** (not `sh`/`dash`). Use `bash` as your shell or run `. ~/esp/esp-idf/export.sh` from bash.
+- If `export.sh` fails with Python dependency errors (e.g., missing `tree_sitter`), re-run `./install.sh` for your target to update the Python virtual environment.
+- After upgrading ESP-IDF (e.g., `git pull`), always re-run `./install.sh` before building.
 
 ### Linux CAN Utilities
 ```bash
@@ -103,7 +113,7 @@ sudo ip link set up can0
 
 ### ESP32 Firmware
 
-Use the provided `build.sh` script for simplified builds:
+Use the provided `build.sh` script for simplified builds (**requires bash**):
 
 ```bash
 git clone https://github.com/hackboxguy/Esp32-CAN-ALS.git
@@ -111,6 +121,9 @@ cd Esp32-CAN-ALS/
 
 # First build (specify target)
 ./build.sh --target=esp32c3 --version=1.0.0
+
+# If ESP-IDF is not in ~/esp/esp-idf, specify the path
+./build.sh --target=esp32c3 --idfpath=/path/to/esp-idf
 
 # Rebuild (target remembered)
 ./build.sh
@@ -125,11 +138,14 @@ cd Esp32-CAN-ALS/
 ./build.sh --clean --target=esp32c3
 
 # With BSEC library for BME680/688 support
-./build.sh --target=esp32c3 --bsecpath=/path/to/bsec.zip
+./build.sh --target=esp32c3 --bsecpath=bsec2-6-1-0_generic_release_22102024.zip
 ```
 
-Or use idf.py directly:
+**Note:** Always run `build.sh` with bash (`./build.sh` or `bash build.sh`), not `sh build.sh`.
+
+Or use idf.py directly (after sourcing `export.sh`):
 ```bash
+. ~/esp/esp-idf/export.sh
 idf.py set-target esp32c3
 idf.py build flash monitor
 ```
